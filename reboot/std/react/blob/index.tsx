@@ -79,15 +79,27 @@ export class BlobUploader {
 
   /**
    * Fetches upload instructions for the given part numbers, waiting
-   * for the blob's upload session to be provisioned.
+   * for the blob's upload session to be provisioned. Rejects for a
+   * blob that is no longer uploading.
    */
   async partUploadInstructions(
     partNumbers: number[],
     options?: { signal?: AbortSignal }
   ): Promise<{ partSize: number; urls: Map<number, string> }> {
-    // `ready` is false until `CreateWorkflow` has provisioned the
-    // data-plane upload session, so watch until it flips rather than
-    // asking again on a timer.
+    // Asked plainly first: a blob that is no longer uploading refuses
+    // with a declared error, which a plain call surfaces and a
+    // reactive read would retry forever. Only a blob whose upload
+    // session is still being provisioned is then watched: `ready` is
+    // false until `CreateWorkflow` has provisioned the session, so
+    // watch until it flips rather than asking again on a timer.
+    const first = await this.blob.getPartUploadInstructions(
+      this.context,
+      { partNumbers },
+      options
+    );
+    if (first.ready) {
+      return this.instructionsFrom(first);
+    }
     options?.signal?.throwIfAborted();
     const controller = new AbortController();
     options?.signal?.addEventListener("abort", () => controller.abort(), {
@@ -102,17 +114,9 @@ export class BlobUploader {
           { signal: controller.signal }
         );
       for await (const response of responses) {
-        if (!response.ready) {
-          continue;
+        if (response.ready) {
+          return this.instructionsFrom(response);
         }
-        const urls = new Map<number, string>();
-        for (const instruction of response.instructions) {
-          urls.set(
-            instruction.partNumber,
-            new URL(instruction.url, this.options.url).toString()
-          );
-        }
-        return { partSize: Number(response.partSize), urls };
       }
       options?.signal?.throwIfAborted();
       throw new Error(
@@ -123,6 +127,24 @@ export class BlobUploader {
       // Tear the stream down as soon as we have our answer.
       controller.abort();
     }
+  }
+
+  /**
+   * The part size and, per requested part, an absolute URL to `PUT`
+   * it to, from a ready response.
+   */
+  private instructionsFrom(response: Blob.GetPartUploadInstructionsResponse): {
+    partSize: number;
+    urls: Map<number, string>;
+  } {
+    const urls = new Map<number, string>();
+    for (const instruction of response.instructions) {
+      urls.set(
+        instruction.partNumber,
+        new URL(instruction.url, this.options.url).toString()
+      );
+    }
+    return { partSize: Number(response.partSize), urls };
   }
 
   /**
@@ -193,13 +215,23 @@ export class BlobUploader {
   async commit(options?: { signal?: AbortSignal }): Promise<UploadResult> {
     // `Commit` returns as soon as the blob is marked COMMITTING; the
     // data plane finalizes the object in a workflow, and the outcome
-    // lands back on the blob's state. Subscribe rather than re-read on
-    // a timer: `Info` is a reader, so the update is pushed. Committing
-    // first is safe because a reactive read always yields current
-    // state before any update, and `Commit` clears the error from a
-    // previous attempt as it marks the blob COMMITTING.
+    // lands back on the blob's state. Committing before watching is
+    // safe because a reactive read always yields current state before
+    // any update, and `Commit` clears the error from a previous
+    // attempt as it marks the blob COMMITTING.
     await this.blob.commit(this.context);
+    return await this.commitVerdict(options);
+  }
 
+  /**
+   * Waits for the verdict on a commit under way: the blob's ETag, or
+   * the reason the commit failed.
+   */
+  private async commitVerdict(options?: {
+    signal?: AbortSignal;
+  }): Promise<UploadResult> {
+    // Subscribe rather than re-read on a timer: `Info` is a reader,
+    // so the update is pushed.
     options?.signal?.throwIfAborted();
     const controller = new AbortController();
     options?.signal?.addEventListener("abort", () => controller.abort(), {
@@ -220,7 +252,9 @@ export class BlobUploader {
           info.status === Blob_Status.REMOVING ||
           info.status === Blob_Status.REMOVED
         ) {
-          return { error: "The blob was removed before it committed" };
+          // Removal is not a verdict on the commit: there is no blob
+          // left to repair or to commit again.
+          throw new Error(`Blob ${this.options.blobId} has been removed`);
         }
       }
       options?.signal?.throwIfAborted();
@@ -243,6 +277,22 @@ export class BlobUploader {
     // Refresh what the control plane already has, so interrupted
     // uploads resume rather than restart.
     const info = await this.blob.info(this.context);
+    switch (info.status) {
+      case Blob_Status.COMMITTED:
+        // A previous attempt got all the way; there is nothing left
+        // to upload or to wait for.
+        return { etag: info.etag };
+      case Blob_Status.COMMITTING:
+        // A previous attempt committed and was interrupted while
+        // waiting for the verdict. Only watch for it: the watch yields
+        // the current state first, so a verdict that has landed since
+        // is answered too, where another `Commit` would find a blob
+        // already committed, or restart one that has just failed.
+        return await this.commitVerdict(options);
+      case Blob_Status.REMOVING:
+      case Blob_Status.REMOVED:
+        throw new Error(`Blob ${this.options.blobId} has been removed`);
+    }
     this.confirmed = new Map(
       info.parts.map((part) => [part.number, Number(part.size)])
     );
@@ -326,11 +376,17 @@ export class BlobUploader {
  * uploading, but `upload` cannot repair it, since it skips every
  * part the blob already has and the verdict does not say which part
  * is at fault; upload again into a new blob, or replace parts through
- * `BlobUploader.putPart` and `commit` again. A rejection is a part
- * that could not be uploaded even after retries; the parts that did
- * upload are kept, so calling `upload` again for the same blob
- * resumes rather than restarts. A blob that is never committed is
- * removed by the backend after a day.
+ * `BlobUploader.putPart` and `commit` again. A rejection is either a
+ * refusal that another `upload` would only repeat -- bytes that do
+ * not add up to the `size` the blob was created with, or a blob
+ * removed meanwhile -- or an interruption: a part that could not be
+ * uploaded even after retries, or the caller's own abort. After an
+ * interruption the parts that did upload are kept, so calling
+ * `upload` again for the same blob resumes rather than restarts:
+ * what is still missing is uploaded, a commit already under way is
+ * waited for, and a blob already committed is answered at once. A
+ * blob that is never committed is removed by the backend after a
+ * day.
  */
 export function useBlobUpload(): {
   upload: (
