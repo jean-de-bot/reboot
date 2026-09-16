@@ -90,8 +90,8 @@ export class BlobUploader {
     // with a declared error, which a plain call surfaces and a
     // reactive read would retry forever. Only a blob whose upload
     // session is still being provisioned is then watched: `ready` is
-    // false until `CreateWorkflow` has provisioned the session, so
-    // watch until it flips rather than asking again on a timer.
+    // false until the session has been provisioned, so watch until it
+    // flips rather than asking again on a timer.
     const first = await this.blob.getPartUploadInstructions(
       this.context,
       { partNumbers },
@@ -214,11 +214,9 @@ export class BlobUploader {
    */
   async commit(options?: { signal?: AbortSignal }): Promise<UploadResult> {
     // `Commit` returns as soon as the blob is marked COMMITTING; the
-    // data plane finalizes the object in a workflow, and the outcome
-    // lands back on the blob's state. Committing before watching is
-    // safe because a reactive read always yields current state before
-    // any update, and `Commit` clears the error from a previous
-    // attempt as it marks the blob COMMITTING.
+    // outcome lands on the blob's state later. Committing before
+    // watching is safe because a reactive read always yields current
+    // state before any update.
     await this.blob.commit(this.context);
     return await this.commitVerdict(options);
   }
