@@ -684,12 +684,29 @@ impl OneShotTasks {
     /// Canonical Wait for this registered local actor. Mount as a PUBLIC
     /// service under ApplicationHost readiness; not a recovery/control route.
     /// Supply the host-owned application/server identity and shared accepted
-    /// placement. This checks read-serving authority, not dispatcher fencing.
+    /// placement. Wait checks read-serving authority and original dispatcher
+    /// generation; result access defaults deny and never grants dispatch authority.
     pub fn wait_service(
         &self,
         application: crate::legacy_placement::LegacyApplicationId,
         server_id: impl Into<String>,
         placement: crate::legacy_placement::PlanOnlyLegacyPlacement,
+    ) -> db::tasks_server::TasksServer<ReaderTaskWaitService> {
+        self.wait_service_with_policy(
+            application,
+            server_id,
+            placement,
+            crate::auth::AuthorizationPolicy::default(),
+        )
+    }
+    /// Mount canonical Wait with an explicit host-owned result policy.
+    /// This does not grant administration or scheduling authority.
+    pub fn wait_service_with_policy(
+        &self,
+        application: crate::legacy_placement::LegacyApplicationId,
+        server_id: impl Into<String>,
+        placement: crate::legacy_placement::PlanOnlyLegacyPlacement,
+        policy: crate::auth::AuthorizationPolicy,
     ) -> db::tasks_server::TasksServer<ReaderTaskWaitService> {
         db::tasks_server::TasksServer::new(ReaderTaskWaitService {
             tasks: [(
@@ -701,7 +718,7 @@ impl OneShotTasks {
             server_id: server_id.into(),
             placement,
             admin: None,
-            wait_policy: None,
+            wait_policy: Some(policy),
         })
     }
     // Called only while the registry owns this actor's DispatchOwner claim.
@@ -1753,7 +1770,7 @@ impl ReaderTaskWaitService {
             server_id,
             placement,
             admin: None,
-            wait_policy: None,
+            wait_policy: Some(crate::auth::AuthorizationPolicy::default()),
         })
     }
     /// Enable local task administration with an explicit application policy.
@@ -1781,7 +1798,7 @@ impl ReaderTaskWaitService {
         self
     }
     /// Protect canonical result lookup with a separate application-owned policy.
-    /// Without this opt-in, Wait retains its existing public development contract.
+    /// Without explicit policy selection, Wait denies result lookup.
     /// Both policies are required. Each pre-Load and post-Load observation verifies
     /// the original credential and authorizes the exact encoded WaitRequest, with
     /// actor type/ref and server-owned app/server identity, but no actor snapshot.
@@ -1797,6 +1814,12 @@ impl ReaderTaskWaitService {
             Some(verifier),
             Some(authorizer),
         ));
+        self
+    }
+    /// Select an explicit result policy, independently of task administration.
+    /// Development hosts may deliberately select `permissive_for_development()`.
+    pub fn with_wait_policy(mut self, policy: crate::auth::AuthorizationPolicy) -> Self {
+        self.wait_policy = Some(policy);
         self
     }
     async fn authorize_wait(
@@ -2563,6 +2586,62 @@ mod tests {
                 }
             })
         }
+    }
+    #[tokio::test]
+    async fn wait_default_denies_before_lookup_and_development_is_explicit() {
+        use db::tasks_server::Tasks;
+        let tasks = OneShotTasks::new(
+            DatabaseActorStore::connect_lazy("http://127.0.0.1:1").unwrap(),
+            "test.WaitDefault".into(),
+            "actor".into(),
+            Binding,
+        )
+        .unwrap();
+        let service = ReaderTaskWaitService::new(
+            [tasks],
+            crate::legacy_placement::LegacyApplicationId::new("application").unwrap(),
+            "server",
+            crate::legacy_placement::PlanOnlyLegacyPlacement::new(),
+        )
+        .unwrap();
+        let id = db::TaskId {
+            state_type: "test.WaitDefault".into(),
+            state_ref: "actor".into(),
+            task_uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        };
+        for reference in ["actor", "unknown"] {
+            let mut request = tonic::Request::new(db::WaitRequest {
+                task_id: Some(db::TaskId {
+                    state_ref: reference.into(),
+                    ..id.clone()
+                }),
+            });
+            request
+                .metadata_mut()
+                .insert(crate::STATE_REF_HEADER, reference.parse().unwrap());
+            assert_eq!(
+                service.wait(request).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        let headers = crate::RebootHeaders::new("actor");
+        let dev = service
+            .clone()
+            .with_wait_policy(crate::auth::AuthorizationPolicy::permissive_for_development());
+        assert!(dev.authorize_wait(&headers, &id, &[]).await.is_ok());
+        assert!(
+            dev.admin.is_none(),
+            "development result access must not enable administration"
+        );
+        let strict = dev.with_wait_policy(crate::auth::AuthorizationPolicy::default());
+        assert_eq!(
+            strict
+                .authorize_wait(&headers, &id, &[])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
     #[tokio::test]
     async fn protected_wait_policy_checks_exact_request_trusted_identity_and_revocation() {

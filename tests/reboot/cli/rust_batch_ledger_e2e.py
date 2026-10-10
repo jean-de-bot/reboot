@@ -423,6 +423,74 @@ def rebuild(session, text):
     return old
 
 
+class DirectPolicySession:
+    """Launch the generated host without the CLI's forced development opt-in."""
+    def __init__(self, name, selection, admin=False):
+        import socket
+        self.name = name
+        state = STAGE / 'direct-policy-state'
+        state.mkdir(exist_ok=True)
+        command([TARGET / 'debug/app', '--server-info', state / 'server-info.pb'])
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            self.database_port = sock.getsockname()[1]
+        host_env = dict(ENV, RBT_NAME='batch_ledger',
+                        RBT_RUST_DATABASE_URL=f'http://127.0.0.1:{self.database_port}',
+                        RBT_RUST_LISTEN_ADDR=f'127.0.0.1:{PORT}')
+        for key in ['RBT_RUST_UNAUTHORIZED_DEVELOPMENT', 'RBT_RUST_TASK_ADMIN_TOKEN',
+                    'RBT_RUST_TASK_RESULT_GRANT', 'RBT_RUST_TASK_RESULT_POLICY_PROBE']:
+            host_env.pop(key, None)
+        if selection is not None:
+            host_env['RBT_RUST_UNAUTHORIZED_DEVELOPMENT'] = selection
+        if admin:
+            host_env['RBT_RUST_TASK_ADMIN_TOKEN'] = 'direct-host-admin-credential'
+        self.out = (STAGE / f'direct-{name}.log').open('w')
+        self.children = []
+        self.data = {'name': name, 'development_selection': selection,
+                     'database_port': self.database_port, 'children': []}
+        evidence['sessions'].append(self.data)
+        # Retain ownership before spawning: __init__ can fail before assignment.
+        global current
+        current = self
+        for args in [[BINARY, state / 'rocksdb', state / 'server-info.pb', self.database_port],
+                     [TARGET / 'debug/app']]:
+            child = subprocess.Popen([str(a) for a in args], cwd=APP, env=host_env,
+                                     stdout=self.out, stderr=subprocess.STDOUT, start_new_session=True)
+            self.children.append(child)
+            self.data['children'].append(child.pid)
+            self.data.setdefault('child_starttimes', []).append(Path(f'/proc/{child.pid}/stat').read_text().split()[21])
+            checkpoint()
+            if len(self.children) == 1:
+                def database_ready():
+                    assert child.poll() is None, 'direct Database exited'
+                    try:
+                        with socket.create_connection(('127.0.0.1', self.database_port), timeout=.2):
+                            return True
+                    except OSError:
+                        return False
+                until(database_ready, 'direct canonical Database startup', 30)
+        def ready():
+            assert all(child.poll() is None for child in self.children), 'direct host exited'
+            return client('health', ok=False)[1] == 0
+        until(ready, 'direct policy host readiness', 60)
+
+    def close(self):
+        for child in reversed(self.children):
+            if child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                global timeout_seen
+                timeout_seen = True
+                evidence['live_handles'].append(self.data)
+                checkpoint()
+                raise
+        self.out.close()
+        check(self.name + ' direct children reaped',
+              all(not Path(f'/proc/{child.pid}').exists() for child in self.children))
+
+
 current = None
 reconnecting = None
 index_watch = None
@@ -595,6 +663,73 @@ try:
     archive_ref = str(StateRef.from_id('rbt.std.collections.v1.SortedMap', 'archived-approvals'))
     if (os.environ.get('RUST_BATCH_WORKFLOW_COMPOSITION_ONLY') or os.environ.get('RUST_BATCH_TRANSACTION_COMPOSITION_ONLY') or os.environ.get('RUST_BATCH_GROUP_COMPOSITION_ONLY')):
         composition_fixture.run(globals())
+        raise SystemExit(0)
+    if os.environ.get('RUST_BATCH_DEFAULT_DENY_ONLY'):
+        import uuid as uuid_module
+        current = DirectPolicySession('policy-seed', '1')
+        client('create')
+        task, _ = client('submit', 'policy', '1', str(uuid_module.uuid4()))
+        client('approve', 'policy', '0')
+        client('wait', task, '10000')
+        def snapshot(task_id=task):
+            data = native(current, task_id)
+            return (data[0].SerializeToString(), data[1].SerializeToString(),
+                    data[2].SerializeToString(), tuple(sorted(x.SerializeToString() for x in data[3])),
+                    archive_rows(current).SerializeToString(), canonical_inventory())
+        def canonical_inventory():
+            with grpc.insecure_channel(f'127.0.0.1:{current.database_port}') as channel:
+                stub = db_grpc.DatabaseStub(channel)
+                receipts = [m.SerializeToString() for reply in stub.RecoverIdempotentMutations(
+                    db.RecoverIdempotentMutationsRequest(state_type='batch_ledger.v1.Ledger', state_ref=reference), timeout=3)
+                    for m in reply.idempotent_mutations]
+                pending = [t.SerializeToString() for reply in stub.Recover(
+                    db.RecoverRequest(shard_ids=['s000000000'], skip_idempotent_mutations=True), timeout=3)
+                    for t in reply.pending_tasks]
+                return tuple(sorted(receipts)), tuple(sorted(pending))
+        before = snapshot()
+        current.close(); current = None
+        for selection in [None, '0', 'true']:
+            current = DirectPolicySession('policy-' + str(selection), selection)
+            denied_key = str(uuid_module.uuid4())
+            evidence.setdefault('denied_submit_keys', []).append(denied_key)
+            checkpoint()
+            for args in [('read',), ('submit', 'policy', '1', denied_key),
+                         ('approve', 'policy', '0'), ('wait', task, '2000')]:
+                text, status = client(*args, ok=False)
+                check(f'{selection!r} denies {args[0]}', status != 0 and 'PermissionDenied' in text)
+            check(f'{selection!r} denial preserves canonical records', snapshot() == before)
+            current.close(); current = None
+        current = DirectPolicySession('policy-exact-one', '1')
+        check('exact 1 allows public read', client('read')[1] == 0)
+        check('exact 1 admits canonical Wait', client('wait', task, '10000')[1] == 0)
+        # Cooperative stop admits immediate batches only. Withhold approval so
+        # the real workflow parks without writer effects during denial checks.
+        next_task, _ = client('submit-stoppable', 'policy-next', '1', str(uuid_module.uuid4()))
+        until(lambda: 'batch-ledger-handler body-policy-next' in (STAGE / 'direct-policy-exact-one.log').read_text(),
+              'stoppable policy workflow entered')
+        text, status = client('wait', next_task, '150', ok=False)
+        check('stoppable policy task remains parked pending',
+              status != 0 and ('DeadlineExceeded' in text or 'Cancelled' in text)
+              and native(current, next_task)[2].status == db.Task.PENDING)
+        stop_before = snapshot(next_task)
+        text, status = client('stop', 'policy-next', next_task, str(uuid_module.uuid4()), ok=False)
+        check('development alone never grants StopBatch', status != 0 and 'PermissionDenied' in text)
+        check('no configured admin denial preserves pending task and receipts', snapshot(next_task) == stop_before)
+        current.close(); current = None
+        current = DirectPolicySession('policy-admin-required', '1', admin=True)
+        credential = ENV.pop('RBT_RUST_TASK_ADMIN_TOKEN')
+        stop_before = snapshot(next_task)
+        try:
+            for value in [None, 'wrong-admin']:
+                if value is not None: ENV['RBT_RUST_TASK_ADMIN_TOKEN'] = value
+                text, status = client('stop', 'policy-next', next_task, str(uuid_module.uuid4()), ok=False)
+                check('development with configured admin rejects ' + str(value),
+                      status != 0 and 'Unauthenticated' in text)
+                check('admin credential denial preserves pending task and receipts', snapshot(next_task) == stop_before)
+        finally:
+            ENV['RBT_RUST_TASK_ADMIN_TOKEN'] = credential
+        current.close(); current = None
+        evidence['accepted'] = True
         raise SystemExit(0)
     if os.environ.get('RUST_BATCH_TASK_RESULT_AUTH_ONLY'):
         import uuid as uuid_module

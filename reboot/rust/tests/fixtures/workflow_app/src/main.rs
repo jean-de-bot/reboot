@@ -556,15 +556,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = DatabaseActorStore::connect(arg(2)).await?;
         let address: std::net::SocketAddr = arg(3).parse()?;
         let (adapter, tasks) =
-            generated::LedgerMethodsDatabaseAdapter::new(store, Ledger::default()).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
+            generated::LedgerMethodsDatabaseAdapter::new(store, Ledger::default())
+                .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
                 .with_workflows(&reference())?;
         if let Ok(limit) = std::env::var("CONTROL_MAX_LIVE") {
             tasks.set_max_live_deliveries(limit.parse()?)?;
         }
-        let wait = tasks.wait_service(
+        let wait = tasks.wait_service_with_policy(
             reboot::legacy_placement::LegacyApplicationId::new("workflow-app")?,
             "server",
             plan(address.port()),
+            reboot::auth::AuthorizationPolicy::permissive_for_development(),
         );
         ApplicationHost::new("workflow-app")
             .with_host_recovery(tasks.recovery(db::RecoverRequest {

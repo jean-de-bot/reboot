@@ -258,41 +258,41 @@ impl generated::TransactionCounterWritesMethodsTransactionHandler for Handler {
         if let Some((marker, block)) = reader
             && request.amount == 9000
         {
-                // Append per invocation: an identical overwritten result cannot
-                // hide replay across Wait calls or host recovery.
-                {
-                    use std::io::Write;
-                    let mut calls = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(format!("{marker}.invocations"))
+            // Append per invocation: an identical overwritten result cannot
+            // hide replay across Wait calls or host recovery.
+            {
+                use std::io::Write;
+                let mut calls = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{marker}.invocations"))
+                    .unwrap();
+                writeln!(calls, "query").unwrap();
+            }
+            std::fs::write(
+                format!("{marker}.started-at"),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    .to_string(),
+            )
+            .unwrap();
+            std::fs::write(marker, state.value.to_string()).unwrap();
+            if block {
+                struct ReaderDrop(String);
+                impl Drop for ReaderDrop {
+                    fn drop(&mut self) {
+                        std::fs::write(
+                            format!("{}.reader-dropped", self.0),
+                            "actual reader future dropped",
+                        )
                         .unwrap();
-                    writeln!(calls, "query").unwrap();
-                }
-                std::fs::write(
-                    format!("{marker}.started-at"),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                        .to_string(),
-                )
-                .unwrap();
-                std::fs::write(marker, state.value.to_string()).unwrap();
-                if block {
-                    struct ReaderDrop(String);
-                    impl Drop for ReaderDrop {
-                        fn drop(&mut self) {
-                            std::fs::write(
-                                format!("{}.reader-dropped", self.0),
-                                "actual reader future dropped",
-                            )
-                            .unwrap();
-                        }
                     }
-                    let _drop = ReaderDrop(marker.clone());
-                    std::future::pending::<()>().await;
                 }
+                let _drop = ReaderDrop(marker.clone());
+                std::future::pending::<()>().await;
+            }
         }
         Ok(proto::TransactionCounterValue { value: state.value })
     }
@@ -473,12 +473,12 @@ impl generated::TransactionCounterWritesMethodsTransactionHandler for Handler {
         if request.amount == -9000
             && let Self::Tasks { marker, .. } = self
         {
-                std::fs::write(
-                    format!("{marker}.cancel"),
-                    "handler entered before durable handoff",
-                )
-                .unwrap();
-                std::future::pending::<()>().await;
+            std::fs::write(
+                format!("{marker}.cancel"),
+                "handler entered before durable handoff",
+            )
+            .unwrap();
+            std::future::pending::<()>().await;
         }
         state.value += request.amount;
         if context.supervised_tree_execution()
@@ -1005,69 +1005,69 @@ impl generated::TransactionCounterWritesMethodsTransactionHandler for Handler {
         if let Self::Root(root) = self
             && let Some(task_marker) = &root.task_marker
         {
-                let mut task = generated::TransactionCounterWritesMethodsTasks::query(
-                    &context.headers().state_ref,
-                    &proto::TransactionIncrementRequest { amount: 9000 },
-                );
-                if has("--root-task-invalid") {
-                    task.method = "Missing".into();
-                }
-                let vector = optional_arg("--task-vector").unwrap_or_default();
-                if let Some(seconds) = vector.strip_prefix("delayed:") {
-                    task.timestamp = Some(prost_types::Timestamp {
-                        seconds: seconds.parse().unwrap(),
-                        nanos: 0,
-                    });
-                }
-                if let Some(id) = vector.strip_prefix("reuse:") {
-                    task.task_id.as_mut().unwrap().task_uuid =
-                        Uuid::parse_str(id).unwrap().as_bytes().to_vec();
-                }
-                match vector.as_str() {
-                    "malformed" => task.request = vec![0xff],
-                    "identity" => task.task_id.as_mut().unwrap().state_ref = "target".into(),
-                    "duplicate" => execution.task_upserts.push(task.clone()),
-                    "capacity" => {
-                        execution.task_upserts = (0..1024)
-                            .map(|_| {
-                                generated::TransactionCounterWritesMethodsTasks::query(
-                                    &context.headers().state_ref,
-                                    &proto::TransactionIncrementRequest { amount: 9000 },
-                                )
-                            })
-                            .collect()
-                    }
-                    _ => {}
-                }
-                std::fs::write(
-                    format!("{task_marker}.task-id"),
-                    Uuid::from_slice(&task.task_id.as_ref().unwrap().task_uuid)
-                        .unwrap()
-                        .to_string(),
-                )
-                .unwrap();
-                if let Some(path) = std::env::var_os("REBOOT_TEST_ROOT_HANDLER_PARK") {
-                    struct HandlerDrop(std::path::PathBuf);
-                    impl Drop for HandlerDrop {
-                        fn drop(&mut self) {
-                            std::fs::write(
-                                self.0.with_extension("handler-dropped"),
-                                b"handler future dropped",
+            let mut task = generated::TransactionCounterWritesMethodsTasks::query(
+                &context.headers().state_ref,
+                &proto::TransactionIncrementRequest { amount: 9000 },
+            );
+            if has("--root-task-invalid") {
+                task.method = "Missing".into();
+            }
+            let vector = optional_arg("--task-vector").unwrap_or_default();
+            if let Some(seconds) = vector.strip_prefix("delayed:") {
+                task.timestamp = Some(prost_types::Timestamp {
+                    seconds: seconds.parse().unwrap(),
+                    nanos: 0,
+                });
+            }
+            if let Some(id) = vector.strip_prefix("reuse:") {
+                task.task_id.as_mut().unwrap().task_uuid =
+                    Uuid::parse_str(id).unwrap().as_bytes().to_vec();
+            }
+            match vector.as_str() {
+                "malformed" => task.request = vec![0xff],
+                "identity" => task.task_id.as_mut().unwrap().state_ref = "target".into(),
+                "duplicate" => execution.task_upserts.push(task.clone()),
+                "capacity" => {
+                    execution.task_upserts = (0..1024)
+                        .map(|_| {
+                            generated::TransactionCounterWritesMethodsTasks::query(
+                                &context.headers().state_ref,
+                                &proto::TransactionIncrementRequest { amount: 9000 },
                             )
-                            .unwrap();
-                        }
+                        })
+                        .collect()
+                }
+                _ => {}
+            }
+            std::fs::write(
+                format!("{task_marker}.task-id"),
+                Uuid::from_slice(&task.task_id.as_ref().unwrap().task_uuid)
+                    .unwrap()
+                    .to_string(),
+            )
+            .unwrap();
+            if let Some(path) = std::env::var_os("REBOOT_TEST_ROOT_HANDLER_PARK") {
+                struct HandlerDrop(std::path::PathBuf);
+                impl Drop for HandlerDrop {
+                    fn drop(&mut self) {
+                        std::fs::write(
+                            self.0.with_extension("handler-dropped"),
+                            b"handler future dropped",
+                        )
+                        .unwrap();
                     }
-                    let path = std::path::PathBuf::from(path);
-                    std::fs::write(&path, b"confirmed remote successful enlistment").unwrap();
-                    let _drop = HandlerDrop(path);
-                    std::future::pending::<()>().await;
                 }
-                if has("--root-handler-error") {
-                    return Err(tonic::Status::invalid_argument(
-                        "explicit root handler rejection after successful remote enlistment",
-                    ));
-                }
-                execution.task_upserts.push(task);
+                let path = std::path::PathBuf::from(path);
+                std::fs::write(&path, b"confirmed remote successful enlistment").unwrap();
+                let _drop = HandlerDrop(path);
+                std::future::pending::<()>().await;
+            }
+            if has("--root-handler-error") {
+                return Err(tonic::Status::invalid_argument(
+                    "explicit root handler rejection after successful remote enlistment",
+                ));
+            }
+            execution.task_upserts.push(task);
         }
         if context.headers().state_ref != "watch-capacity"
             && let Some(marker) = optional_arg("--tree-local-tasks")
@@ -1257,11 +1257,10 @@ impl generated::TransactionCounterWritesMethodsTransactionHandler for Handler {
         Ok(proto::TransactionCounterValue { value: state.value })
     }
 }
-type RecoveryWork = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), tonic::Status>> + Send>>;
+type RecoveryWork =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), tonic::Status>> + Send>>;
 
-struct FullWatchProof(
-    tokio::sync::Mutex<Option<RecoveryWork>>,
-);
+struct FullWatchProof(tokio::sync::Mutex<Option<RecoveryWork>>);
 #[tonic::async_trait]
 impl reboot::application_host::HostRecovery for FullWatchProof {
     async fn start(
@@ -1771,7 +1770,8 @@ async fn main() {
         let adapter = generated::ExternalConstructorMethodsDatabaseAdapter::new(
             store,
             ExternalConstructorHandler,
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
         let address = listen.parse().unwrap();
         let surface_first_success_unavailable = has("--surface-first-success-unavailable");
         let server = tokio::spawn(async move {
@@ -1964,7 +1964,8 @@ async fn main() {
             coordinator.clone(),
             starts,
             LegacyRollbackHandler(handler),
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
         .with_live_participant_owner(owner)
         .with_supervised_transaction_tree();
         let legacy = if has("--sequential-root-star") {
@@ -1993,7 +1994,8 @@ async fn main() {
         coordinator.clone(),
         starts,
         handler,
-    ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
+    )
+    .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
     let adapter = if let Some(ceiling) = optional_arg("--replay-auth-ceiling") {
         adapter.with_authorization(reboot::auth::AuthorizationPolicy::new(
             None,
@@ -2142,7 +2144,8 @@ async fn main() {
                 block: false,
                 vector: String::new(),
             },
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
         .with_explicit_abort_owner(root_owner);
         host = host.with_host_recovery(FullRootProof { marker, work: tokio::sync::Mutex::new(Some(Box::pin(async move {
             use proto::transaction_counter_writes_methods_server::TransactionCounterWritesMethods;
@@ -2191,7 +2194,8 @@ async fn main() {
                 child: Uuid::from_u128(3),
             },
             Handler::Target,
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development())
         .with_live_participant_owner(live_owner.clone().unwrap());
         host = host.with_host_recovery(FullWatchProof(tokio::sync::Mutex::new(Some(Box::pin(async move {
             use proto::transaction_counter_writes_methods_server::TransactionCounterWritesMethods;
@@ -2252,10 +2256,11 @@ async fn main() {
                     skip_idempotent_mutations: true,
                 }),
             )
-            .add_public_service(owner.wait_service(
+            .add_public_service(owner.wait_service_with_policy(
                 application.clone(),
                 "server-0",
                 prime_placement,
+                reboot::auth::AuthorizationPolicy::permissive_for_development(),
             ));
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let singleton = tokio::spawn(prime.serve_with_shutdown(address, async {
@@ -2340,7 +2345,8 @@ async fn main() {
                 block: has("--block-task"),
                 vector: String::new(),
             },
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
         let (_, second) = second_adapter.with_one_shot_reader_tasks("second").unwrap();
         if !has("--shared-task-recovery") {
             host = host.with_host_recovery(
@@ -2381,7 +2387,8 @@ async fn main() {
             GaugeTaskHandler {
                 marker: arg("--second-task-marker"),
             },
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
+        )
+        .with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
         let (_, gauge) = adapter.with_one_shot_reader_tasks("root").unwrap();
         if !has("--shared-task-recovery") {
             host = host.with_host_recovery(
@@ -2438,7 +2445,8 @@ async fn main() {
                 optional_arg("--server-id").unwrap_or_else(|| "server-0".into()),
                 placement.clone(),
             )
-            .unwrap(),
+            .unwrap()
+            .with_wait_policy(reboot::auth::AuthorizationPolicy::permissive_for_development()),
         ))
     };
     if has("--duplicate-task-registration") {

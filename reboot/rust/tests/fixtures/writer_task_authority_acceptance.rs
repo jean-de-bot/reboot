@@ -318,7 +318,7 @@ fn custom_writer_receipt_store_and_replay_binding_drop_fails_graceful_shutdown()
                 .with_legacy_placement_readiness(placement.clone())
                 .with_host_recovery(PlacementPlannerRecovery::new(&planner.endpoint, placement.clone()).unwrap())
                 .with_host_recovery(tasks.recovery(database::RecoverRequest { state_tags_by_state_type: [(id.state_type.clone(), "TransactionCounter".into())].into(), shard_ids: vec!["s000000000".into()], skip_idempotent_mutations: true }))
-                .add_public_service(tasks.wait_service(app, "server-0", placement));
+                .add_public_service(tasks.wait_service_with_policy(app, "server-0", placement, reboot_rust_schema::auth::AuthorizationPolicy::permissive_for_development()));
             let (shutdown, stopped) = tokio::sync::oneshot::channel();
             let serving = tokio::spawn(host.serve_with_shutdown(format!("127.0.0.1:{listen}").parse().unwrap(), async { let _ = stopped.await; }));
             if tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.is_err() {
@@ -457,7 +457,7 @@ fn custom_writer_negative_checkpoint_missing_actor_and_losing_cas_preserve_recor
                 .with_legacy_placement_readiness(placement.clone())
                 .with_host_recovery(PlacementPlannerRecovery::new(&planner.endpoint, placement.clone()).unwrap())
                 .with_host_recovery(tasks.recovery(database::RecoverRequest { state_tags_by_state_type: [(id.state_type.clone(), "TransactionCounter".into())].into(), shard_ids: vec!["s000000000".into()], skip_idempotent_mutations: true }))
-                .add_public_service(tasks.wait_service(app, "server-0", placement));
+                .add_public_service(tasks.wait_service_with_policy(app, "server-0", placement, reboot_rust_schema::auth::AuthorizationPolicy::permissive_for_development()));
             let result = tokio::time::timeout(Duration::from_secs(5), host.serve_with_shutdown(format!("127.0.0.1:{listen}").parse().unwrap(), std::future::pending::<()>())).await.unwrap();
             assert!(matches!(result, Err(ApplicationHostError::RecoveryTask(ref status)) if status.code() == if vector == "malformed-response" { tonic::Code::DataLoss } else { tonic::Code::FailedPrecondition }), "vector {vector}: {result:?}");
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), usize::from(matches!(vector, "cas-false" | "forged-declared")));

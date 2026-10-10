@@ -75,9 +75,9 @@ impl reboot::auth::Authorizer for TaskAdmin {
         })
     }
 }
-// Only StopBatch gains new credential policy. Existing development RPCs retain
-// their old access rules; no client header can grant task or completion authority.
-struct StopAccess(Option<Arc<TaskAdmin>>);
+// Ordinary methods require explicit host development opt-in. StopBatch always
+// requires its independent admin credential; no caller header grants authority.
+struct StopAccess(Option<Arc<TaskAdmin>>, bool);
 impl reboot::auth::TokenVerifier for StopAccess {
     fn verify<'a>(
         &'a self,
@@ -102,8 +102,9 @@ impl reboot::auth::Authorizer for StopAccess {
         _: &'a [u8],
     ) -> reboot::auth::AuthorizeFuture<'a> {
         Box::pin(async move {
-            if context.method != "{{ name }}.v1.LedgerWorkMethods.StopBatch"
-                || (context.state_type == STATE_TYPE
+            if (context.method != "{{ name }}.v1.LedgerWorkMethods.StopBatch" && self.1)
+                || (context.method == "{{ name }}.v1.LedgerWorkMethods.StopBatch"
+                    && context.state_type == STATE_TYPE
                     && state.is_some()
                     && auth.is_some_and(|a| a.payload()["task_admin"] == true))
             {
@@ -440,7 +441,10 @@ pub async fn serve(
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
-    let stop_access = Arc::new(StopAccess(admin.clone()));
+    let stop_access = Arc::new(StopAccess(
+        admin.clone(),
+        std::env::var("RBT_RUST_UNAUTHORIZED_DEVELOPMENT").as_deref() == Ok("1"),
+    ));
     let (work, tasks) = generated::LedgerWorkMethodsDatabaseAdapter::new(store.clone(), Ledger)
         .with_authorization(reboot::auth::AuthorizationPolicy::new(
             Some(stop_access.clone()),
@@ -461,6 +465,11 @@ pub async fn serve(
         "local-rust",
         placement(&application, address)?,
     )?;
+    let wait = if std::env::var("RBT_RUST_UNAUTHORIZED_DEVELOPMENT").as_deref() == Ok("1") {
+        wait.with_wait_policy(reboot::auth::AuthorizationPolicy::permissive_for_development())
+    } else {
+        wait
+    };
     let wait = match admin {
         Some(admin) => wait.with_admin_authorization(admin.clone(), admin),
         None => wait,

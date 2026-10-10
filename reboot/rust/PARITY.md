@@ -121,16 +121,49 @@ stages retain frozen manifests/exits; the final public driver records source
 and binary identities, `passed=true`, and owned-child cleanup.
 
 Source review approved the bounded inbound fix. This is **not full A1/A2 or
-production security parity**: canonical Wait without a configured result policy
-and batch non-StopBatch authorization still allow by default; production ingress,
-User ownership and trusted internal provenance remain missing. Malformed/absent
+production security parity**. The subsequent Wait/batch checkpoint below closes
+the default-allow paths; production ingress, User ownership and trusted internal
+provenance remain missing. Malformed/absent
 inbound-state denial, parked-policy cancellation under alternate ownership,
 uncertain cleanup, transport denial and custom-policy Allow need broader proofs.
-Manual-host unset/invalid/exact-one environment selection is source-mapped, not
-fully exercised natively. HTTP/tasks/subscriptions need their own coverage.
+Manual-host unset/invalid/exact-one batch selection is exercised below; other
+HTTP/tasks/subscriptions paths need their own coverage.
 Reproducible experimental release gates and current-head/merge-result full native
 audits remain outstanding. Earlier failed stages and historical composite native
 inventories are not current-snapshot full certification.
+
+## Canonical Wait and generated batch default-deny checkpoint (2026-10-10)
+
+Direct and convenience canonical Wait mounts now default deny. Explicit result
+policies (including development allowance) remain independent of administrative
+scheduling access and preserve result ownership fences. Batch ordinary/index
+methods allow development access only for exact environment value `1`; StopBatch
+still requires independent configured administration. Configured result grants
+replace development Wait permission rather than composing with it.
+
+Retained composite acceptance, not a single current-head full SDK/native audit:
+- `1791645557924050880`: 20 task-policy tests, 34 generated downstream cases plus
+  one enclosing test; strict all-target SDK and complete native consumer Clippy.
+- `1791645931873260808`: CLI regression, real canonical Wait and restart/redelivery
+  native cases (one each), full public greeting persistence/watch/cleanup driver.
+- `1791646653515343823`: expanded real canonical Wait denial case for both mounts,
+  Pending/Completed tasks and absent/caller credentials; strict SDK Clippy.
+- `1791646880656352462`: configured result-grant public batch driver, including
+  denial, revocation, unchanged records, persisted restart and child cleanup.
+- `1791654697083109786`: direct generated-host unset/`0`/`true` denial for read,
+  submit, approve and Wait; exact `1` allowance; pending stoppable task isolation
+  for no configured admin and missing/wrong credentials. Ordinary mutation
+  receipts and pending inventory are checked alongside selected task checkpoints;
+  this is not an inventory of every workflow-scoped mutation. Generated consumer
+  strict Clippy/fmt and nonzero tests passed. Driver exit 0, frozen mismatch list
+  empty, accepted artifact true, live handles empty and owned children reaped.
+
+The earlier selector stage `1791654518749253762` failed because its test fixture
+requested a future-scheduled cooperative batch, which the real contract rejects.
+The replacement uses an immediate batch parked by withholding approval; no runtime
+contract or assertion was weakened. Static source/fixture reviews are distinct
+from executed acceptance. Production security and experimental release gaps above
+remain outstanding; this checkpoint does not establish full authorization parity.
 
 ## How to read the evidence
 
@@ -2895,7 +2928,7 @@ and the checker itself; it is not a full toolchain/dependency lock or native bin
 certificate. If relevant implementation changes, re-audit claims and appropriate
 acceptance before refreshing it; do not merely regenerate the number.
 
-<!-- parity-source-sha256: d16593b98d51120c6c29c88161eb73a00bd56953568b9d8e0df12697908128df -->
+<!-- parity-source-sha256: 3f2179ec95095a8fc231a74cbb5771d1968a80048b647787bb5edce835bba946 -->
 
 New feature work updates this ledger in the same verified commit, not another
 candidate/status file. Status is by public use case and safe admitted shapes,

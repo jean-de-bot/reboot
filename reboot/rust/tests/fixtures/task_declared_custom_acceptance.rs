@@ -44,7 +44,7 @@ fn custom_declared_registration_association_and_completion_winners_fail_closed()
             let host = ApplicationHost::new("generated-cxx-database-process").with_legacy_placement_readiness(placement.clone())
                 .with_host_recovery(PlacementPlannerRecovery::new(&planner.endpoint, placement.clone()).unwrap())
                 .with_host_recovery(tasks.recovery(database::RecoverRequest { state_tags_by_state_type: [(id.state_type.clone(), "TransactionCounter".into())].into(), shard_ids: vec!["s000000000".into()], skip_idempotent_mutations: true }))
-                .add_public_service(tasks.wait_service(app, "server-0", placement));
+                .add_public_service(tasks.wait_service_with_policy(app, "server-0", placement, reboot_rust_schema::auth::AuthorizationPolicy::permissive_for_development()));
             let (shutdown, stopped) = tokio::sync::oneshot::channel();
             let serving = tokio::spawn(host.serve_with_shutdown(format!("127.0.0.1:{listen}").parse().unwrap(), async { let _ = stopped.await; }));
             if vector == "declared-cas-equal" {
