@@ -12,6 +12,36 @@ applications are **not a requirement or a parity gap**. Existing canonical
 protocols are implementation contracts, not an interoperability certification.
 No overall percentage is asserted.
 
+## Frozen-snapshot native audit (2026-10-10)
+
+The default Cargo-helper consumer fixture now uses its actual SDK dependency
+name, `reboot_rust_schema`, for the explicit development authorization policy.
+This is a test-fixture alias correction, not a runtime policy relaxation.
+
+At HEAD `a68871e7bdf3298e9a09106d55468684a36d59e7` plus that exact fixture
+repair, all 131 ignored native inventory cases passed: SortedMap 3, generated
+CXX 114, reactive restart 1, workflow restart 5, and native 2PC 8. The SDK
+all-target gate and both SDK/generated-consumer strict Clippy gates exited 0.
+The SDK log records 483 passes including nested consumer tests; ignored tests
+are accounted for separately by the native execution.
+
+The frozen source snapshot remained unchanged across the original stage
+`/tmp/reboot-rust-current-head-full-audit-1791655473259651199` and continuation
+`/tmp/reboot-rust-full-native-continuation-1791666414622448069`. The original
+runner exited 1 after CXX passed because it incorrectly required zero filtered
+ordinary tests; the corrected continuation verified prior exact inventories,
+source hashes and process cleanup, then ran only the remaining 14 cases.
+Each native suite exited 0 with its exact selected-case inventory and no live
+recorded children; the continuation produced `accepted.json`. Two ordinary CXX
+tests and five ordinary native-2PC tests were legitimately filtered by
+`--ignored`. The canonical Database hash recorded by the continuation is
+`5240488d0a9ff3ed3a6685c93b70fd2c59533df0c150b1c65008aa9f4dc89845`.
+
+This is acceptance of the repaired checkout snapshot across two retained stages,
+not merge-result/CI certification, production readiness or full parity. Legacy
+Echo authorization, rebuild efficiency and the checkout-only generated/runtime
+compatibility contract remain unimplemented priorities.
+
 ## Native fixture corrections (2026-10-10)
 
 The disabled task-administration fixture now expects the runtime's fail-closed
@@ -2928,7 +2958,7 @@ and the checker itself; it is not a full toolchain/dependency lock or native bin
 certificate. If relevant implementation changes, re-audit claims and appropriate
 acceptance before refreshing it; do not merely regenerate the number.
 
-<!-- parity-source-sha256: 3f2179ec95095a8fc231a74cbb5771d1968a80048b647787bb5edce835bba946 -->
+<!-- parity-source-sha256: 6d9c6929a3f91ddeb05bbabb9018630db075b9b44ddcf98d5a4a3d901e27c5ba -->
 
 New feature work updates this ledger in the same verified commit, not another
 candidate/status file. Status is by public use case and safe admitted shapes,

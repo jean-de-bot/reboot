@@ -3181,7 +3181,7 @@ mod tests {
         let adapter = generated::CounterWritesMethodsDatabaseAdapter::new(
             DatabaseActorStore::connect(&database_endpoint).await.unwrap(),
             Counter,
-        ).with_authorization(reboot::auth::AuthorizationPolicy::permissive_for_development());
+        ).with_authorization(reboot_rust_schema::auth::AuthorizationPolicy::permissive_for_development());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
