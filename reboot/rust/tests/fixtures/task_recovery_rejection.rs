@@ -48,14 +48,7 @@ fn prove_recovered_batch_boundary(
 ) {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();

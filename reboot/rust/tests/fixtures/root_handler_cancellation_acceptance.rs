@@ -22,14 +22,7 @@ fn owned_root_caught_outbound_failure_empty_membership_publishes_authoritative_a
 fn coupled_root_acceptance(scenario: &str) {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let database_binary = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
     let root_db = CxxDatabase::start(database_binary.clone());

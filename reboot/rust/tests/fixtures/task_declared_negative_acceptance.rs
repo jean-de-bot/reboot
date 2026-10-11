@@ -3,12 +3,7 @@
 fn generated_declared_task_malformed_wrong_method_terminals_fail_closed() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(Command::new("cargo")
-        .args(["build", "--locked"])
-        .current_dir(&fixture)
-        .status()
-        .unwrap()
-        .success());
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for vector in [
         "url",

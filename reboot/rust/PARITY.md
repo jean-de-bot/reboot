@@ -12,6 +12,72 @@ applications are **not a requirement or a parity gap**. Existing canonical
 protocols are implementation contracts, not an interoperability certification.
 No overall percentage is asserted.
 
+## Echo authorization and checkout contract checkpoint (2026-10-11)
+
+Legacy Echo memory, file and Database hosts now default deny. The standalone
+executable opts into isolated development only for exact
+`RBT_RUST_UNAUTHORIZED_DEVELOPMENT=1`; library hosts never infer that policy
+from the environment. Credentials are verified before actor admission/storage;
+current immutable state and request bytes are authorized before typed decoding,
+receipt disclosure or effects. Memory/file gates span authorization through the
+operation and release on cancellation. Weak gate registrations do not retain
+rejected actors indefinitely; sequential denial tests are not a global concurrent
+resource-bound proof. File hosts mask unavailable/corrupt storage diagnostics
+before Allow and never fabricate an authorization snapshot.
+
+New ordinary/workflow/SortedMap adapters emit one anonymous alias-aware const
+check for checkout API contract 1. Genuine aliased SDK consumers exercise match
+and mismatch/regeneration diagnostics. This is not packaging, wire compatibility,
+persisted-state migration, a production launcher or release certification.
+Cargo adapter outputs are written only when bytes change; include watches remain
+conservative. Frozen CXX tests reuse successful/failed preparation only inside
+one process; nested fixtures still use fresh hosts/databases and unchanged runtime
+assertions. ACK markers publish completed bytes via same-directory atomic rename,
+not polling retries; visibility is not crash durability.
+
+**Executed on the pre-format repaired snapshot based on `16ff72b4`:**
+`/tmp/reboot-rust-repaired-auth-reuse-audit-1791683363548924557` records
+SDK all-target exit 0 (503 passes including nested consumers), strict SDK and
+complete generated-CXX-consumer Clippy exit 0, SortedMap 3/3 and CXX 114/114.
+The aggregate stopped at its disk guard after these successful suites. An earlier
+failed marker-race run and a pre-execution disk-blocked continuation are retained
+and are not accepted cases.
+
+`/tmp/reboot-rust-repaired-auth-reuse-continuation-1791684919739833172`
+verified unchanged frozen source, prior exits and cleanup, then passed reactive
+1/1, workflow 5/5 and native 2PC 8/8, all exit 0. Its `accepted.json` certifies
+those remaining 14 cases. Together the retained stages cover the exact **131**
+ignored native cases on the same source; they are not one uninterrupted run.
+Actual retained PID/start identities were absent and the exclusive lock released.
+Canonical Database identity matches the prior audit. Five ordinary CXX cases and
+five ordinary native-2PC cases are filtered, not ignored-inventory failures.
+
+Publication formatting is separately recorded at
+`/tmp/reboot-rust-publication-format-1791685543988821062`: six files differ only
+by verified deterministic rustfmt output. The native evidence above belongs to
+its original byte hashes; it is not an exact-byte audit of the formatted checkout.
+**Fresh repaired-source acceptance:**
+`/tmp/reboot-rust-repaired-auth-reuse-audit-1791686456896434227` records
+SDK all-target exit 0 (506 passes including nested consumers), both strict
+Clippy gates exit 0, and all 131 native cases passing (3/114/1/5/8).
+`/tmp/reboot-rust-postdiagnostic-public-gates-1791687838814802648` records
+CLI unit and actual public greeting gates exit 0, including persisted restart,
+same-key replay, watcher rebuilds, host/Database exit supervision and failed
+live-rebuild cleanup. Both accepted artifacts were read back, frozen hashes
+matched, and retained PID/start identities were absent.
+
+Database authorized readers, writers and constructors reject missing policy
+before Load, after verifier checks. Failed pre-Allow Load discards diagnostic
+messages/details/metadata, retaining only Unavailable retry classification;
+other failures become PermissionDenied. No synthetic snapshot is authorized.
+Post-Allow receipt/persistence errors and uncertainty semantics are unchanged.
+New regressions reproduced the leak (2 failed/1 passed), then passed 3/3;
+Echo regressions passed 15/15. Applied-source security review found no blocker.
+These are bounded checkout acceptance results, not full parity or CI approval. Python receipt-before-admission
+ordering is not claimed identical; production User ownership/trusted provenance,
+transport denial coverage, broad task/HTTP policy coverage, dependency-watch
+invalidation proofs, packaging and current merge-result/CI acceptance remain open.
+
 ## Frozen-snapshot native audit (2026-10-10)
 
 The default Cargo-helper consumer fixture now uses its actual SDK dependency
@@ -2958,7 +3024,7 @@ and the checker itself; it is not a full toolchain/dependency lock or native bin
 certificate. If relevant implementation changes, re-audit claims and appropriate
 acceptance before refreshing it; do not merely regenerate the number.
 
-<!-- parity-source-sha256: 6d9c6929a3f91ddeb05bbabb9018630db075b9b44ddcf98d5a4a3d901e27c5ba -->
+<!-- parity-source-sha256: fa1639e50d88c1e1fe8e982ba7d6b7a4ddfa4427311aa28013c8bea2af19bec3 -->
 
 New feature work updates this ledger in the same verified commit, not another
 candidate/status file. Status is by public use case and safe admitted shapes,

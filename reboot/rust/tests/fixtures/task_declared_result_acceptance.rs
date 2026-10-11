@@ -3,14 +3,7 @@
 fn generated_declared_reader_writer_restart_and_fenced_handler_failure() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for vector in ["reader", "writer", "retry", "before-cas"] {
         let runtime = tokio::runtime::Runtime::new().unwrap();

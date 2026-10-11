@@ -63,7 +63,7 @@ fn generated_reader_task_shared_host_shutdown_drops_reader_and_redelivers_pendin
 fn run_task_wait_registry(heterogeneous: bool, shared: bool, reject: Option<bool>, transition: bool, shutdown: bool) {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(Command::new("cargo").args(["build", "--locked"]).current_dir(&fixture).status().unwrap().success());
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());
     let mut second_db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());

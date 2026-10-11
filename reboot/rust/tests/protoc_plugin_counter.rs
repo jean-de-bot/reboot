@@ -3108,6 +3108,40 @@ async fn generated_transaction_client_reroutes_through_legacy_application_placem
         .status()
         .unwrap();
     assert!(status.success());
+
+    // The matching consumer above uses the real SDK renamed to `reboot`.
+    // Change only an emitted guard literal; leave runtime and adapter APIs intact.
+    let build_path = fixture.join("build.rs");
+    let source = std::fs::read_to_string(&build_path).unwrap();
+    let prefix = source.strip_suffix("}\n").unwrap();
+    let contract = reboot_rust_schema::versioning::GENERATED_CODE_CONTRACT;
+    let guard = format!("check_generated_code_compatible({contract})");
+    let mismatch = format!("check_generated_code_compatible({})", contract + 1);
+    let mutation = format!(
+        r#"
+    let path = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("tests/reboot/protoc/counter.reboot.rs");
+    let emitted = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(emitted.matches({guard:?}).count(), 1);
+    std::fs::write(path, emitted.replacen({guard:?}, {mismatch:?}, 1)).unwrap();
+}}
+"#
+    );
+    std::fs::write(&build_path, format!("{prefix}{mutation}")).unwrap();
+    let output = Command::new("cargo")
+        .args(["check", "--offline"])
+        .current_dir(&fixture)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mismatched consumer unexpectedly compiled"
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("generated-code contract mismatch"),
+        "{diagnostics}"
+    );
+    assert!(diagnostics.contains("regenerate adapters"), "{diagnostics}");
 }
 
 #[test]

@@ -3,14 +3,7 @@
 fn generated_writer_task_staged_prepared_no_dispatch_and_at_deadline() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for vector in ["staged", "prepared", "at"] {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -178,14 +171,7 @@ fn generated_writer_task_staged_prepared_no_dispatch_and_at_deadline() {
 fn generated_writer_task_negative_identity_schedule_and_inactive_owner_no_effects() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for vector in [
         "identity",
@@ -273,14 +259,7 @@ fn generated_writer_task_negative_identity_schedule_and_inactive_owner_no_effect
 fn generated_writer_task_failed_ingress_before_exclusive_drop_real_host() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());

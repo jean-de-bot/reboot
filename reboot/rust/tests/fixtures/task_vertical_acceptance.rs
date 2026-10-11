@@ -173,14 +173,7 @@ pub(super) async fn load_task(endpoint: &str, id: database::TaskId) -> database:
 fn generated_reader_task_live_pending_plus_staged_capacity_boundary() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for (vector, expected_state, staged_present) in
         [("saturation-allowed", 12, true), ("saturation", 5, false)]
@@ -304,16 +297,8 @@ fn generated_task_uncertainty_cancels_competing_admitted_rpc_then_restart_comple
 fn prove_cancellation_ownership(vector: &str) {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let binary = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
-        .join("debug/generated-cxx-database-process-host");
+    crate::prepare_generated_host(&fixture);
+    let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(store_counter(&db.endpoint(), "root", 5));
@@ -431,18 +416,8 @@ fn generated_one_shot_reader_task_commit_restart_redelivery_completion_no_redisp
     let database_binary = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| fixture.join("target"));
-    let binary = target.join("debug/generated-cxx-database-process-host");
+    crate::prepare_generated_host(&fixture);
+    let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(store_counter(&db.endpoint(), "root", 5));

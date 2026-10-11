@@ -134,11 +134,23 @@ where
                 ))
             },
         )?;
-        std::fs::write(&path, content).map_err(|error| {
+        write_if_changed(&path, content.as_bytes()).map_err(|error| {
             BuildError::new(format!("could not write `{}`: {error}", path.display()))
         })?;
     }
     Ok(())
+}
+
+// Preserve output identity when a build script reruns for unrelated inputs.
+// Read errors other than absence are not hidden by overwriting the target.
+fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == content => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::write(path, content)
 }
 
 fn includes_with_vendored<I: AsRef<Path>>(includes: &[I], vendored: &Path) -> Vec<PathBuf> {
@@ -188,4 +200,40 @@ fn output_path(out_dir: &Path, name: &str) -> Result<PathBuf, BuildError> {
         )));
     }
     Ok(out_dir.join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_if_changed;
+
+    #[test]
+    fn unchanged_adapter_preserves_output_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter.reboot.rs");
+        write_if_changed(&path, b"adapter v1").unwrap();
+        // Pin a sentinel timestamp: rewriting identical bytes must not alter it.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        file.set_times(std::fs::FileTimes::new().set_modified(sentinel))
+            .unwrap();
+        write_if_changed(&path, b"adapter v1").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            sentinel
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"adapter v1");
+        write_if_changed(&path, b"adapter v2").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"adapter v2");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            sentinel
+        );
+    }
+
+    #[test]
+    fn adapter_output_read_errors_are_not_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_if_changed(dir.path(), b"adapter").is_err());
+        assert!(dir.path().is_dir());
+    }
 }

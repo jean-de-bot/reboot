@@ -2851,7 +2851,13 @@ async fn main() {
                 4242
             }
         );
-        std::fs::write(arg("--invoke-marker"), limit.to_string()).unwrap();
+        // Readers use marker existence as publication. Publish completed bytes
+        // atomically: File::create inside fs::write otherwise exposes an empty
+        // marker before write_all finishes.
+        let marker = std::path::PathBuf::from(arg("--invoke-marker"));
+        let pending = marker.with_extension("pending");
+        std::fs::write(&pending, limit.to_string()).unwrap();
+        std::fs::rename(&pending, &marker).unwrap();
     }
     if let Some(task_uuid) = optional_arg("--writer-wait") {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{listen}"))

@@ -1654,7 +1654,8 @@ mod writer_failure_lifecycle_tests {
         let address = socket.local_addr().unwrap();
         drop(socket);
         let service = crate::proto::echo_methods_server::EchoMethodsServer::new(
-            crate::runtime::InMemoryHost::default(),
+            crate::runtime::InMemoryHost::default()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         );
         let host =
             ApplicationHost::new("sticky-writer-failure").with_host_recovery(FailDuringStart);
@@ -1714,7 +1715,8 @@ mod writer_failure_lifecycle_tests {
         let address = socket.local_addr().unwrap();
         drop(socket);
         let service = crate::proto::echo_methods_server::EchoMethodsServer::new(
-            crate::runtime::InMemoryHost::default(),
+            crate::runtime::InMemoryHost::default()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         );
         let host = ApplicationHost::new("sticky-writer-failure")
             .with_host_recovery(FailDuringStart)
@@ -1902,7 +1904,8 @@ mod health_watch_tests {
         let mut registry = crate::reactive::LocalReaderRegistry::new();
         registry.register(readers).unwrap();
         let service = crate::proto::echo_methods_server::EchoMethodsServer::new(
-            crate::runtime::InMemoryHost::default(),
+            crate::runtime::InMemoryHost::default()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         );
         let mut host = ApplicationHost::new("registry-readiness")
             .add_public_service(service)

@@ -2551,6 +2551,22 @@ pub(crate) fn same_actor_gate(endpoint: &str, state_type: &str, state_ref: &str)
     }
 }
 
+// Weak registrations preserve identity while any lease/waiter owns the gate,
+// without retaining a permanent gate for every rejected actor reference.
+fn local_echo_gate(
+    gates: &Mutex<HashMap<String, std::sync::Weak<ActorGateInner>>>,
+    state_ref: &str,
+) -> ActorGate {
+    let mut gates = gates.lock().expect("host gate map mutex poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(inner) = gates.get(state_ref).and_then(std::sync::Weak::upgrade) {
+        return ActorGate { inner };
+    }
+    let gate = ActorGate::new();
+    gates.insert(state_ref.to_owned(), Arc::downgrade(&gate.inner));
+    gate
+}
+
 /// An in-memory host for the generated `EchoMethods` Tonic service.
 ///
 /// Clones share all actors. State is process-local and is lost when the host is
@@ -2558,12 +2574,56 @@ pub(crate) fn same_actor_gate(endpoint: &str, state_type: &str, state_ref: &str)
 #[derive(Clone, Default)]
 pub struct InMemoryHost {
     actors: Arc<Mutex<HashMap<String, Arc<EchoActor>>>>,
+    gates: Arc<Mutex<HashMap<String, std::sync::Weak<ActorGateInner>>>>,
+    authorization: crate::auth::AuthorizationPolicy,
 }
 
 impl InMemoryHost {
     /// Creates an empty host. An actor is allocated on its first valid request.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_authorization(mut self, authorization: crate::auth::AuthorizationPolicy) -> Self {
+        self.authorization = authorization;
+        self
+    }
+
+    async fn authorized_snapshot<T: Message>(
+        &self,
+        request: &Request<T>,
+        method: &str,
+    ) -> Result<(ExclusiveActorLease, proto::Echo), Status> {
+        let (context, auth) = self
+            .authorization
+            .verify(
+                crate::RebootHeaders::from_request(request)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                "tests.reboot.protoc.Echo",
+                method,
+            )
+            .await?;
+        let state_ref = required_metadata(request, STATE_REF_HEADER)?;
+        let gate = local_echo_gate(&self.gates, &state_ref);
+        let lease = gate.exclusive().await;
+        let actor = self
+            .actors
+            .lock()
+            .expect("host actor map mutex poisoned")
+            .get(&state_ref)
+            .cloned();
+        let snapshot = actor
+            .map(|actor| actor.reader(Clone::clone))
+            .unwrap_or_default();
+        self.authorization
+            .authorize(
+                &context,
+                auth.as_ref(),
+                Some(&snapshot.encode_to_vec()),
+                &request.get_ref().encode_to_vec(),
+            )
+            .await?;
+        Ok((lease, snapshot))
     }
 
     fn actor_for(&self, request: &Request<impl Sized>) -> Result<Arc<EchoActor>, Status> {
@@ -2586,6 +2646,8 @@ impl InMemoryHost {
 pub struct FileBackedHost {
     root: Arc<PathBuf>,
     actors: Arc<Mutex<HashMap<String, Arc<FileBackedEchoActor>>>>,
+    gates: Arc<Mutex<HashMap<String, std::sync::Weak<ActorGateInner>>>>,
+    authorization: crate::auth::AuthorizationPolicy,
 }
 
 impl FileBackedHost {
@@ -2596,22 +2658,98 @@ impl FileBackedHost {
         Ok(Self {
             root: Arc::new(root),
             actors: Arc::new(Mutex::new(HashMap::new())),
+            gates: Arc::new(Mutex::new(HashMap::new())),
+            authorization: crate::auth::AuthorizationPolicy::default(),
         })
     }
 
-    fn actor_for(&self, request: &Request<impl Sized>) -> Result<Arc<FileBackedEchoActor>, Status> {
+    pub fn with_authorization(mut self, authorization: crate::auth::AuthorizationPolicy) -> Self {
+        self.authorization = authorization;
+        self
+    }
+
+    async fn authorized_actor<T: Message>(
+        &self,
+        request: &Request<T>,
+        method: &str,
+    ) -> Result<(ExclusiveActorLease, Arc<FileBackedEchoActor>), Status> {
+        let (context, auth) = self
+            .authorization
+            .verify(
+                crate::RebootHeaders::from_request(request)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                "tests.reboot.protoc.Echo",
+                method,
+            )
+            .await?;
+        self.authorization.require_authorizer()?;
         let state_ref = required_metadata(request, STATE_REF_HEADER)?;
-        let mut actors = self.actors.lock().expect("host actor map mutex poisoned");
-        if let Some(actor) = actors.get(&state_ref) {
-            return Ok(actor.clone());
-        }
-        let actor =
-            FileBackedEchoActor::open(actor_path(&self.root, &state_ref)).map_err(|error| {
-                Status::internal(format!("failed to load persisted actor state: {error}"))
-            })?;
-        let actor = Arc::new(actor);
-        actors.insert(state_ref, actor.clone());
-        Ok(actor)
+        let gate = local_echo_gate(&self.gates, &state_ref);
+        let lease = gate.exclusive().await;
+        let cached = self
+            .actors
+            .lock()
+            .expect("host actor map mutex poisoned")
+            .get(&state_ref)
+            .cloned();
+        let path = actor_path(&self.root, &state_ref);
+        let persisted = if cached.is_none() {
+            match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => return Err(Status::permission_denied("actor authorization unavailable")),
+            }
+        } else {
+            None
+        };
+        // Decode only the outer envelope, not Echo or receipt contents, before Allow.
+        let snapshot = if let Some(actor) = &cached {
+            actor.reader(Message::encode_to_vec)
+        } else if let Some(bytes) = &persisted {
+            let raw = RawPersistedEchoActor::decode(bytes.as_slice())
+                .map_err(|_| Status::permission_denied("actor authorization unavailable"))?;
+            if raw.state.len() > 1 {
+                return Err(Status::permission_denied("actor authorization unavailable"));
+            }
+            raw.state
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| proto::Echo::default().encode_to_vec())
+        } else {
+            proto::Echo::default().encode_to_vec()
+        };
+        self.authorization
+            .authorize(
+                &context,
+                auth.as_ref(),
+                Some(&snapshot),
+                &request.get_ref().encode_to_vec(),
+            )
+            .await?;
+        let actor = match cached {
+            Some(actor) => actor,
+            None => {
+                let state = match persisted {
+                    Some(bytes) => decode_actor(&bytes).map_err(|error| {
+                        Status::internal(format!("failed to decode persisted actor: {error}"))
+                    })?,
+                    None => FileBackedEchoActorState {
+                        state: proto::Echo::default(),
+                        completed_writes: HashMap::new(),
+                    },
+                };
+                let actor = Arc::new(FileBackedEchoActor {
+                    path,
+                    inner: Mutex::new(state),
+                });
+                self.actors
+                    .lock()
+                    .expect("host actor map mutex poisoned")
+                    .insert(state_ref, actor.clone());
+                actor
+            }
+        };
+        Ok((lease, actor))
     }
 }
 
@@ -2630,6 +2768,15 @@ struct FileBackedEchoActorState {
 struct PersistedCompletedWrite {
     request_fingerprint: Option<Vec<u8>>,
     response: proto::Text,
+}
+
+// Same protobuf envelope wire tags; nested messages remain opaque until Allow.
+#[derive(Clone, Message)]
+struct RawPersistedEchoActor {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    state: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    completed_writes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Message)]
@@ -2651,6 +2798,7 @@ struct PersistedWrite {
 }
 
 impl FileBackedEchoActor {
+    #[cfg(test)]
     fn open(path: PathBuf) -> io::Result<Self> {
         let state = if path.exists() {
             decode_actor(&fs::read(&path)?)?
@@ -3614,6 +3762,9 @@ impl DatabaseActorStore {
             ),
             None => None,
         };
+        if let Some(policy) = authorization {
+            policy.require_authorizer()?;
+        }
         let fingerprint = request_fingerprint(method_identity, request.get_ref());
         let state_ref = required_metadata(&request, STATE_REF_HEADER)?;
         let key = idempotency_key(&request)?;
@@ -3624,7 +3775,17 @@ impl DatabaseActorStore {
         // Unauthenticated compatibility calls retain their historical replay path.
         let authorized_state =
             if let (Some(policy), Some((context, auth))) = (authorization, verified.as_ref()) {
-                let state_bytes = self.load_state_bytes(state_type, &state_ref).await?;
+                let state_bytes = self
+                    .load_state_bytes(state_type, &state_ref)
+                    .await
+                    .map_err(|error| {
+                        // Preserve the existing pre-effect transport retry classification only.
+                        if error.code() == tonic::Code::Unavailable {
+                            Status::unavailable("actor authorization unavailable")
+                        } else {
+                            Status::permission_denied("actor authorization unavailable")
+                        }
+                    })?;
                 let default_bytes = State::default().encode_to_vec();
                 policy
                     .authorize(
@@ -3852,6 +4013,7 @@ impl DatabaseActorStore {
                 method_identity,
             )
             .await?;
+        authorization.require_authorizer()?;
         let fingerprint = request_fingerprint(method_identity, request.get_ref());
         let state_ref = required_metadata(&request, STATE_REF_HEADER)?;
         let key = idempotency_key(&request)?;
@@ -3859,7 +4021,14 @@ impl DatabaseActorStore {
         let _guard = lock.exclusive().await;
         let state_bytes = self
             .load_state_bytes(Declaration::STATE_TYPE, &state_ref)
-            .await?;
+            .await
+            .map_err(|error| {
+                if error.code() == tonic::Code::Unavailable {
+                    Status::unavailable("actor authorization unavailable")
+                } else {
+                    Status::permission_denied("actor authorization unavailable")
+                }
+            })?;
         authorization
             .authorize(
                 &context,
@@ -4017,6 +4186,7 @@ impl DatabaseActorStore {
             )
             .await?;
         crate::reactive::check_reader_scope(&request)?;
+        authorization.require_authorizer()?;
         let state_ref = required_metadata(&request, STATE_REF_HEADER)?;
         // Composed callbacks receive an owned immutable snapshot, not a lease.
         // Hold shared admission through Load+authorization, then release before
@@ -4036,7 +4206,15 @@ impl DatabaseActorStore {
         };
         let state_bytes = self
             .load_state_bytes(Declaration::STATE_TYPE, &state_ref)
-            .await?;
+            .await
+            .map_err(|error| {
+                // Preserve the existing pre-effect transport retry classification only.
+                if error.code() == tonic::Code::Unavailable {
+                    Status::unavailable("actor authorization unavailable")
+                } else {
+                    Status::permission_denied("actor authorization unavailable")
+                }
+            })?;
         let default_bytes = Declaration::State::default().encode_to_vec();
         crate::reactive::check_reader_scope(&request)?;
         authorization
@@ -4094,11 +4272,28 @@ impl DatabaseActorStore {
 #[derive(Clone)]
 pub struct EchoMethodsAdapter {
     store: DatabaseActorStore,
+    authorization: crate::auth::AuthorizationPolicy,
+}
+
+struct EchoDurableState;
+
+impl DurableStateDeclaration for EchoDurableState {
+    type State = proto::Echo;
+    const STATE_TYPE: &'static str = "tests.reboot.protoc.Echo";
 }
 
 impl EchoMethodsAdapter {
+    /// Creates a deny-default adapter; development access requires explicit opt-in.
     pub fn new(store: DatabaseActorStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            authorization: crate::auth::AuthorizationPolicy::default(),
+        }
+    }
+
+    pub fn with_authorization(mut self, authorization: crate::auth::AuthorizationPolicy) -> Self {
+        self.authorization = authorization;
+        self
     }
 
     pub async fn connect(endpoint: impl AsRef<str>) -> Result<Self, tonic::transport::Error> {
@@ -4201,6 +4396,9 @@ fn check_idempotency_key_not_expired_at(key: Uuid, now_ms: u128) -> Result<(), S
 #[tonic::async_trait]
 impl proto::echo_methods_server::EchoMethods for InMemoryHost {
     async fn reply(&self, request: Request<proto::Text>) -> Result<Response<proto::Text>, Status> {
+        let (_lease, _) = self
+            .authorized_snapshot(&request, ECHO_REPLY_METHOD_IDENTITY)
+            .await?;
         let actor = self.actor_for(&request)?;
         let key = idempotency_key(&request)?;
         let fingerprint = request_fingerprint(ECHO_REPLY_METHOD_IDENTITY, request.get_ref());
@@ -4218,16 +4416,19 @@ impl proto::echo_methods_server::EchoMethods for InMemoryHost {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::Text>, Status> {
-        let actor = self.actor_for(&request)?;
-        let message = actor.reader(|state| state.last_message.clone().unwrap_or_default());
-        Ok(Response::new(message))
+        let (_lease, snapshot) = self
+            .authorized_snapshot(&request, "tests.reboot.protoc.EchoMethods.LastMessage")
+            .await?;
+        Ok(Response::new(snapshot.last_message.unwrap_or_default()))
     }
 }
 
 #[tonic::async_trait]
 impl proto::echo_methods_server::EchoMethods for FileBackedHost {
     async fn reply(&self, request: Request<proto::Text>) -> Result<Response<proto::Text>, Status> {
-        let actor = self.actor_for(&request)?;
+        let (_lease, actor) = self
+            .authorized_actor(&request, ECHO_REPLY_METHOD_IDENTITY)
+            .await?;
         let key = idempotency_key(&request)?;
         let fingerprint = request_fingerprint(ECHO_REPLY_METHOD_IDENTITY, request.get_ref());
         let message = request.into_inner();
@@ -4239,7 +4440,9 @@ impl proto::echo_methods_server::EchoMethods for FileBackedHost {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::Text>, Status> {
-        let actor = self.actor_for(&request)?;
+        let (_lease, actor) = self
+            .authorized_actor(&request, "tests.reboot.protoc.EchoMethods.LastMessage")
+            .await?;
         let message = actor.reader(|state| state.last_message.clone().unwrap_or_default());
         Ok(Response::new(message))
     }
@@ -4249,9 +4452,10 @@ impl proto::echo_methods_server::EchoMethods for FileBackedHost {
 impl proto::echo_methods_server::EchoMethods for EchoMethodsAdapter {
     async fn reply(&self, request: Request<proto::Text>) -> Result<Response<proto::Text>, Status> {
         self.store
-            .writer_async_with_method::<proto::Echo, _, _, _>(
-                "tests.reboot.protoc.Echo",
+            .writer_async_for_method_with_admission_authorized::<EchoDurableState, _, _, _>(
                 ECHO_REPLY_METHOD_IDENTITY,
+                StateAdmission::DefaultOnAbsent,
+                &self.authorization,
                 request,
                 |state, request| {
                     Box::pin(async move {
@@ -4267,13 +4471,17 @@ impl proto::echo_methods_server::EchoMethods for EchoMethodsAdapter {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::Text>, Status> {
-        let state_ref = required_metadata(&request, STATE_REF_HEADER)?;
-        let state = self.store.load::<proto::Echo>(&state_ref).await?;
-        Ok(Response::new(
-            state
-                .and_then(|state| state.last_message)
-                .unwrap_or_default(),
-        ))
+        self.store
+            .reader_async_for_with_admission_authorized::<EchoDurableState, _, _, _>(
+                "tests.reboot.protoc.EchoMethods.LastMessage",
+                StateAdmission::DefaultOnAbsent,
+                &self.authorization,
+                request,
+                |state, _| {
+                    Box::pin(async move { Ok(state.last_message.clone().unwrap_or_default()) })
+                },
+            )
+            .await
     }
 }
 
@@ -4357,9 +4565,28 @@ pub mod test_support {
         mutations: HashMap<(String, String, Vec<u8>), database::IdempotentMutation>,
         store_requests: Vec<database::StoreRequest>,
         create_requests: Vec<database::CreateActorRequest>,
+        #[cfg(test)]
+        load_calls: usize,
+        #[cfg(test)]
+        receipt_recovery_calls: usize,
+        #[cfg(test)]
+        load_failure: Option<Status>,
     }
 
     impl FakeDatabase {
+        #[cfg(test)]
+        pub(crate) fn clear_actor_load_failure(&self) {
+            self.state.lock().unwrap().load_failure = None;
+        }
+        #[cfg(test)]
+        pub(crate) fn fail_actor_load(&self, status: Status) {
+            self.state.lock().unwrap().load_failure = Some(status);
+        }
+        #[cfg(test)]
+        pub(crate) fn admission_rpc_counts(&self) -> (usize, usize) {
+            let state = self.state.lock().unwrap();
+            (state.load_calls, state.receipt_recovery_calls)
+        }
         #[cfg(test)]
         pub(crate) fn seed_actor(&self, state_type: &str, state_ref: &str, bytes: Vec<u8>) {
             self.state
@@ -4444,6 +4671,14 @@ pub mod test_support {
             &self,
             request: Request<database::LoadRequest>,
         ) -> Result<Response<database::LoadResponse>, Status> {
+            #[cfg(test)]
+            {
+                let mut state = self.state.lock().unwrap();
+                state.load_calls += 1;
+                if let Some(status) = &state.load_failure {
+                    return Err(status.clone());
+                }
+            }
             #[cfg(test)]
             if !request.get_ref().task_ids.is_empty() {
                 let park = self.task_load_park.lock().unwrap().take();
@@ -4595,6 +4830,10 @@ pub mod test_support {
             &self,
             request: Request<database::RecoverIdempotentMutationsRequest>,
         ) -> Result<Response<Self::RecoverIdempotentMutationsStream>, Status> {
+            #[cfg(test)]
+            {
+                self.state.lock().unwrap().receipt_recovery_calls += 1;
+            }
             let request = request.into_inner();
             let state = self.state.lock().expect("fake database mutex poisoned");
             let idempotent_mutations = state
@@ -5983,9 +6222,16 @@ mod tests {
     }
 
     async fn start_host() -> (String, tokio::task::JoinHandle<()>) {
+        start_memory_host(
+            InMemoryHost::new()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
+        )
+        .await
+    }
+
+    async fn start_memory_host(host: InMemoryHost) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let host = InMemoryHost::new();
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(proto::echo_methods_server::EchoMethodsServer::new(host))
@@ -5994,6 +6240,753 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn memory_echo_default_denial_does_not_allocate_actors() {
+        let host = InMemoryHost::new();
+        let (address, server) = start_memory_host(host.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        let context = ExternalContext::new("denied-memory");
+        assert_eq!(
+            client
+                .reply(
+                    context
+                        .writer_with_key(
+                            proto::Text {
+                                content: "secret".into()
+                            },
+                            Uuid::from_u128(8001)
+                        )
+                        .unwrap()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(host.actors.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn memory_echo_authorization_cancellation_releases_snapshot_gate() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationDecision, AuthorizationPolicy,
+            AuthorizeFuture, Authorizer,
+        };
+        use proto::echo_methods_server::EchoMethods;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ParkFirst {
+            first: AtomicBool,
+            entered: tokio::sync::Notify,
+            never: tokio::sync::Notify,
+        }
+        impl Authorizer for ParkFirst {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                state: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(
+                        proto::Echo::decode(state.unwrap()).unwrap(),
+                        proto::Echo::default()
+                    );
+                    if self.first.swap(false, Ordering::SeqCst) {
+                        self.entered.notify_one();
+                        self.never.notified().await;
+                    }
+                    AuthorizationDecision::Allow
+                })
+            }
+        }
+        let policy = Arc::new(ParkFirst {
+            first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            never: tokio::sync::Notify::new(),
+        });
+        let host = InMemoryHost::new()
+            .with_authorization(AuthorizationPolicy::new(None, Some(policy.clone())));
+        let first_host = host.clone();
+        let first = tokio::spawn(async move {
+            first_host
+                .reply(
+                    ExternalContext::new("parked-memory")
+                        .writer_with_key(
+                            proto::Text {
+                                content: "A".into(),
+                            },
+                            Uuid::from_u128(8002),
+                        )
+                        .unwrap(),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), policy.entered.notified())
+            .await
+            .unwrap();
+        assert!(host.actors.lock().unwrap().is_empty());
+        let second_host = host.clone();
+        let mut second = tokio::spawn(async move {
+            second_host
+                .reply(
+                    ExternalContext::new("parked-memory")
+                        .writer_with_key(
+                            proto::Text {
+                                content: "B".into(),
+                            },
+                            Uuid::from_u128(8003),
+                        )
+                        .unwrap(),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(host.actors.lock().unwrap().is_empty());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.into_inner().content, "B");
+        let actor = host
+            .actors
+            .lock()
+            .unwrap()
+            .get("parked-memory")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            actor.reader(|state| state.last_message.as_ref().unwrap().content.clone()),
+            "B"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_echo_authorization_cancellation_releases_snapshot_gate() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationDecision, AuthorizationPolicy,
+            AuthorizeFuture, Authorizer,
+        };
+        use proto::echo_methods_server::EchoMethods;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ParkFirst {
+            first: AtomicBool,
+            entered: tokio::sync::Notify,
+            never: tokio::sync::Notify,
+        }
+        impl Authorizer for ParkFirst {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                state: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(
+                        proto::Echo::decode(state.unwrap()).unwrap(),
+                        proto::Echo::default()
+                    );
+                    if self.first.swap(false, Ordering::SeqCst) {
+                        self.entered.notify_one();
+                        self.never.notified().await;
+                    }
+                    AuthorizationDecision::Allow
+                })
+            }
+        }
+        let policy = Arc::new(ParkFirst {
+            first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            never: tokio::sync::Notify::new(),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = actor_path(directory.path(), "parked-file");
+        let host = FileBackedHost::open(directory.path())
+            .unwrap()
+            .with_authorization(AuthorizationPolicy::new(None, Some(policy.clone())));
+        let first_host = host.clone();
+        let first = tokio::spawn(async move {
+            first_host
+                .reply(
+                    ExternalContext::new("parked-file")
+                        .writer_with_key(
+                            proto::Text {
+                                content: "A".into(),
+                            },
+                            Uuid::from_u128(8002),
+                        )
+                        .unwrap(),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), policy.entered.notified())
+            .await
+            .unwrap();
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert!(!path.exists());
+        let second_host = host.clone();
+        let mut second = tokio::spawn(async move {
+            second_host
+                .reply(
+                    ExternalContext::new("parked-file")
+                        .writer_with_key(
+                            proto::Text {
+                                content: "B".into(),
+                            },
+                            Uuid::from_u128(8003),
+                        )
+                        .unwrap(),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert!(!path.exists());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.into_inner().content, "B");
+        let bytes = fs::read(&path).unwrap();
+        let persisted = PersistedEchoActor::decode(bytes.as_slice()).unwrap();
+        assert_eq!(persisted.state.unwrap().last_message.unwrap().content, "B");
+        assert_eq!(persisted.completed_writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_echo_missing_authorizer_masks_outer_envelope_and_io_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let malformed = actor_path(directory.path(), "malformed-envelope");
+        fs::write(&malformed, [0xff]).unwrap();
+        let duplicate = actor_path(directory.path(), "duplicate-envelope");
+        let duplicate_bytes = RawPersistedEchoActor {
+            state: vec![
+                proto::Echo::default().encode_to_vec(),
+                proto::Echo::default().encode_to_vec(),
+            ],
+            completed_writes: Vec::new(),
+        }
+        .encode_to_vec();
+        fs::write(&duplicate, &duplicate_bytes).unwrap();
+        let unreadable = actor_path(directory.path(), "unreadable-envelope");
+        fs::create_dir(&unreadable).unwrap();
+        let host = FileBackedHost::open(directory.path()).unwrap();
+        let (address, server) = start_file_host(host.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        let mut outcomes = Vec::new();
+        for reference in [
+            "absent-envelope",
+            "malformed-envelope",
+            "duplicate-envelope",
+            "unreadable-envelope",
+        ] {
+            let context = ExternalContext::new(reference);
+            let read = client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err();
+            let write = client
+                .reply(
+                    context
+                        .writer_with_key(
+                            proto::Text {
+                                content: "secret".into(),
+                            },
+                            Uuid::new_v4(),
+                        )
+                        .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(read.code(), tonic::Code::PermissionDenied);
+            assert_eq!(write.code(), tonic::Code::PermissionDenied);
+            outcomes.push((read.message().to_owned(), write.message().to_owned()));
+        }
+        assert!(outcomes.iter().all(|outcome| outcome == &outcomes[0]));
+        assert!(host.gates.lock().unwrap().is_empty());
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&malformed).unwrap(), [0xff]);
+        assert_eq!(fs::read(&duplicate).unwrap(), duplicate_bytes);
+        assert!(unreadable.is_dir());
+        assert!(!actor_path(directory.path(), "absent-envelope").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn file_echo_rejects_duplicate_state_snapshot_before_disclosure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = actor_path(directory.path(), "ambiguous-file-echo");
+        let secret = proto::Echo {
+            last_message: Some(proto::Text {
+                content: "secret".into(),
+            }),
+        };
+        let bytes = RawPersistedEchoActor {
+            state: vec![
+                secret.encode_to_vec(),
+                proto::Echo::default().encode_to_vec(),
+            ],
+            completed_writes: Vec::new(),
+        }
+        .encode_to_vec();
+        // Establish the exact raw-last/typed-merge counterexample.
+        assert_eq!(
+            PersistedEchoActor::decode(bytes.as_slice()).unwrap().state,
+            Some(secret)
+        );
+        fs::write(&path, &bytes).unwrap();
+        let host = FileBackedHost::open(directory.path())
+            .unwrap()
+            .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development());
+        let (address, server) = start_file_host(host.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        let context = ExternalContext::new("ambiguous-file-echo");
+        let error = client
+            .last_message(context.reader(proto::Empty {}).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "actor authorization unavailable");
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn file_echo_unavailable_snapshot_fails_closed_without_authorizer_or_diagnostics() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationPolicy, AuthorizeFuture, Authorizer,
+        };
+        struct Unreachable;
+        impl Authorizer for Unreachable {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                _: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                panic!("cannot authorize an unavailable or ambiguous snapshot");
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let malformed = actor_path(directory.path(), "configured-malformed");
+        fs::write(&malformed, [0xff]).unwrap();
+        let unreadable = actor_path(directory.path(), "configured-unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        let host = FileBackedHost::open(directory.path())
+            .unwrap()
+            .with_authorization(AuthorizationPolicy::new(None, Some(Arc::new(Unreachable))));
+        let (address, server) = start_file_host(host.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        for reference in ["configured-malformed", "configured-unreadable"] {
+            let context = ExternalContext::new(reference);
+            let read = client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err();
+            let write = client
+                .reply(
+                    context
+                        .writer_with_key(
+                            proto::Text {
+                                content: "secret".into(),
+                            },
+                            Uuid::new_v4(),
+                        )
+                        .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            for error in [read, write] {
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                assert_eq!(error.message(), "actor authorization unavailable");
+            }
+        }
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&malformed).unwrap(), [0xff]);
+        assert!(unreadable.is_dir());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn file_echo_denial_precedes_typed_state_and_receipt_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = actor_path(directory.path(), "corrupt-denied-echo");
+        let bytes = RawPersistedEchoActor {
+            state: vec![vec![0xff]],
+            completed_writes: vec![vec![0xff]],
+        }
+        .encode_to_vec();
+        fs::write(&path, &bytes).unwrap();
+        let host = FileBackedHost::open(directory.path()).unwrap();
+        let (address, server) = start_file_host(host.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        let context = ExternalContext::new("corrupt-denied-echo");
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .reply(
+                    context
+                        .writer_with_key(
+                            proto::Text {
+                                content: "must not overwrite".into()
+                            },
+                            Uuid::from_u128(8101)
+                        )
+                        .unwrap()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(host.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        server.abort();
+        let allowed = FileBackedHost::open(directory.path())
+            .unwrap()
+            .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development());
+        let (address, server) = start_file_host(allowed.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        assert!(allowed.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_echo_revocation_uses_current_state_and_survives_file_reopen() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationDecision, AuthorizationPolicy,
+            AuthorizeFuture, Authorizer,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Revocable {
+            allow: AtomicBool,
+            snapshots: Mutex<Vec<proto::Echo>>,
+        }
+        impl Authorizer for Revocable {
+            fn authorize<'a>(
+                &'a self,
+                context: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                state: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(context.state_type, "tests.reboot.protoc.Echo");
+                    assert_eq!(context.headers.state_ref, "revocable-local");
+                    self.snapshots
+                        .lock()
+                        .unwrap()
+                        .push(proto::Echo::decode(state.unwrap()).unwrap());
+                    if self.allow.load(Ordering::SeqCst) {
+                        AuthorizationDecision::Allow
+                    } else {
+                        AuthorizationDecision::PermissionDenied {
+                            message: "revoked".into(),
+                        }
+                    }
+                })
+            }
+        }
+        for file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let policy = Arc::new(Revocable {
+                allow: AtomicBool::new(true),
+                snapshots: Mutex::new(Vec::new()),
+            });
+            let authorization = AuthorizationPolicy::new(None, Some(policy.clone()));
+            let memory = InMemoryHost::new().with_authorization(authorization.clone());
+            let disk = FileBackedHost::open(directory.path())
+                .unwrap()
+                .with_authorization(authorization.clone());
+            let (address, server) = if file {
+                start_file_host(disk).await
+            } else {
+                start_memory_host(memory.clone()).await
+            };
+            let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+                .await
+                .unwrap();
+            let context = ExternalContext::new("revocable-local");
+            let key = Uuid::from_u128(8201);
+            let a = proto::Text {
+                content: "A".into(),
+            };
+            let b = proto::Text {
+                content: "B".into(),
+            };
+            client
+                .reply(context.writer_with_key(a.clone(), key).unwrap())
+                .await
+                .unwrap();
+            client
+                .reply(
+                    context
+                        .writer_with_key(b.clone(), Uuid::from_u128(8202))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let path = actor_path(directory.path(), "revocable-local");
+            let before = if file {
+                Some(fs::read(&path).unwrap())
+            } else {
+                None
+            };
+            policy.allow.store(false, Ordering::SeqCst);
+            for _ in 0..2 {
+                assert_eq!(
+                    client
+                        .reply(context.writer_with_key(a.clone(), key).unwrap())
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+                assert_eq!(
+                    client
+                        .last_message(context.reader(proto::Empty {}).unwrap())
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+            }
+            server.abort();
+            let (address, server) = if file {
+                start_file_host(
+                    FileBackedHost::open(directory.path())
+                        .unwrap()
+                        .with_authorization(authorization),
+                )
+                .await
+            } else {
+                start_memory_host(memory).await
+            };
+            let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .reply(context.writer_with_key(a.clone(), key).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                client
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            {
+                let snapshots = policy.snapshots.lock().unwrap();
+                assert_eq!(snapshots.len(), 8);
+                assert!(
+                    snapshots[2..]
+                        .iter()
+                        .all(|state| state.last_message.as_ref() == Some(&b))
+                );
+            }
+            if let Some(before) = before {
+                assert_eq!(fs::read(&path).unwrap(), before);
+            }
+            policy.allow.store(true, Ordering::SeqCst);
+            assert_eq!(
+                client
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap()
+                    .into_inner(),
+                b
+            );
+            assert_eq!(
+                client
+                    .reply(context.writer_with_key(a.clone(), key).unwrap())
+                    .await
+                    .unwrap()
+                    .into_inner(),
+                a
+            );
+            assert_eq!(
+                client
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap()
+                    .into_inner(),
+                b
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_echo_verifier_rejection_precedes_gate_file_and_authorizer() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationPolicy, AuthorizeFuture, Authorizer,
+            TokenVerification, TokenVerifier, VerifyFuture,
+        };
+        struct Reject;
+        impl TokenVerifier for Reject {
+            fn verify<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a str>,
+            ) -> VerifyFuture<'a> {
+                Box::pin(async {
+                    TokenVerification::Unauthenticated {
+                        message: "rejected credential".into(),
+                    }
+                })
+            }
+        }
+        struct Unreachable;
+        impl Authorizer for Unreachable {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                _: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                panic!("rejected verifier must bypass authorizer");
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = actor_path(directory.path(), "rejected-verifier");
+        fs::write(&path, [0xff]).unwrap();
+        let policy = AuthorizationPolicy::new(Some(Arc::new(Reject)), Some(Arc::new(Unreachable)));
+        let memory = InMemoryHost::new().with_authorization(policy.clone());
+        let file = FileBackedHost::open(directory.path())
+            .unwrap()
+            .with_authorization(policy);
+        let (memory_address, memory_server) = start_memory_host(memory.clone()).await;
+        let (file_address, file_server) = start_file_host(file.clone()).await;
+        for address in [memory_address, file_address] {
+            let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+                .await
+                .unwrap();
+            let context = ExternalContext::new("rejected-verifier");
+            assert_eq!(
+                client
+                    .reply(
+                        context
+                            .writer_with_key(proto::Text::default(), Uuid::from_u128(8203))
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+            assert_eq!(
+                client
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+        }
+        assert!(memory.actors.lock().unwrap().is_empty());
+        assert!(memory.gates.lock().unwrap().is_empty());
+        assert!(file.actors.lock().unwrap().is_empty());
+        assert!(file.gates.lock().unwrap().is_empty());
+        assert_eq!(fs::read(path).unwrap(), [0xff]);
+        memory_server.abort();
+        file_server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_echo_denied_actor_references_do_not_retain_live_gates() {
+        use proto::echo_methods_server::EchoMethods;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = InMemoryHost::new();
+        let file = FileBackedHost::open(directory.path()).unwrap();
+        for index in 0..128 {
+            let context = ExternalContext::new(format!("denied-{index}"));
+            assert_eq!(
+                memory
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                file.last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            for gates in [&memory.gates, &file.gates] {
+                let gates = gates.lock().unwrap();
+                assert!(gates.len() <= 1);
+                assert!(gates.values().all(|gate| gate.upgrade().is_none()));
+            }
+        }
+        assert!(memory.actors.lock().unwrap().is_empty());
+        assert!(file.actors.lock().unwrap().is_empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     async fn start_participant_host(
@@ -6363,6 +7356,488 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn echo_adapter_verifier_rejection_precedes_load_and_receipt_recovery() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationPolicy, AuthorizeFuture, Authorizer,
+            TokenVerification, TokenVerifier, VerifyFuture,
+        };
+        struct Reject;
+        impl TokenVerifier for Reject {
+            fn verify<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a str>,
+            ) -> VerifyFuture<'a> {
+                Box::pin(async {
+                    TokenVerification::Unauthenticated {
+                        message: "rejected credential".into(),
+                    }
+                })
+            }
+        }
+        struct Unreachable;
+        impl Authorizer for Unreachable {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                _: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                panic!("rejected verifier must bypass authorizer")
+            }
+        }
+        let (endpoint, database, database_server) = start_database().await;
+        let adapter = EchoMethodsAdapter::connect(&endpoint)
+            .await
+            .unwrap()
+            .with_authorization(AuthorizationPolicy::new(
+                Some(Arc::new(Reject)),
+                Some(Arc::new(Unreachable)),
+            ));
+        let (address, server) = start_echo_adapter(adapter).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        let context = ExternalContext::new("rejected-database");
+        let before = database.admission_rpc_counts();
+        let mut write = context
+            .writer_with_key(
+                proto::Text {
+                    content: "secret".into(),
+                },
+                Uuid::from_u128(8100),
+            )
+            .unwrap();
+        write
+            .metadata_mut()
+            .insert("authorization", "Bearer rejected".parse().unwrap());
+        assert_eq!(
+            client.reply(write).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut read = context.reader(proto::Empty {}).unwrap();
+        read.metadata_mut()
+            .insert("authorization", "Bearer rejected".parse().unwrap());
+        assert_eq!(
+            client.last_message(read).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(database.admission_rpc_counts(), before);
+        assert!(database.store_requests().is_empty());
+        server.abort();
+        database_server.abort();
+    }
+
+    #[tokio::test]
+    async fn database_preallow_fault_still_verifies_before_missing_authorizer_denial() {
+        use crate::auth::{
+            AuthorizationContext, AuthorizationPolicy, TokenVerification, TokenVerifier,
+            VerifyFuture,
+        };
+        use proto::echo_methods_server::EchoMethods;
+        struct Reject;
+        impl TokenVerifier for Reject {
+            fn verify<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a str>,
+            ) -> VerifyFuture<'a> {
+                Box::pin(async {
+                    TokenVerification::Unauthenticated {
+                        message: "rejected-before-load".into(),
+                    }
+                })
+            }
+        }
+        let (endpoint, database, server) = start_database().await;
+        database.fail_actor_load(Status::unavailable("private-load"));
+        let adapter = EchoMethodsAdapter::connect(&endpoint)
+            .await
+            .unwrap()
+            .with_authorization(AuthorizationPolicy::new(Some(Arc::new(Reject)), None));
+        let context = ExternalContext::new("verifier-before-load");
+        let before = database.admission_rpc_counts();
+        let errors = [
+            adapter
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err(),
+            adapter
+                .reply(
+                    context
+                        .writer_with_key(proto::Text::default(), Uuid::from_u128(9400))
+                        .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            assert_eq!(error.message(), "rejected-before-load");
+        }
+        assert_eq!(database.admission_rpc_counts(), before);
+        assert!(database.store_requests().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn database_authorized_require_existing_and_constructor_mask_preallow_faults() {
+        let (endpoint, database, server) = start_database().await;
+        let store = DatabaseActorStore::connect(&endpoint).await.unwrap();
+        let context = ExternalContext::new("generic-load-diagnostic");
+        database.fail_actor_load(Status::unavailable("private generic load"));
+        for development in [false, true] {
+            let policy = if development {
+                crate::auth::AuthorizationPolicy::permissive_for_development()
+            } else {
+                crate::auth::AuthorizationPolicy::default()
+            };
+            let before = database.admission_rpc_counts();
+            let reader = store.reader_async_for_with_admission_authorized::<EchoDurableState, proto::Empty, proto::Text, _>(
+                "generic.Reader", StateAdmission::RequireExisting, &policy,
+                context.reader(proto::Empty {}).unwrap(),
+                |_, _| Box::pin(async { panic!("Load failure must bypass reader") })).await.unwrap_err();
+            let writer = store.writer_async_for_method_with_admission_authorized::<EchoDurableState, proto::Text, proto::Text, _>(
+                "generic.Writer", StateAdmission::RequireExisting, &policy,
+                context.writer_with_key(proto::Text::default(), Uuid::from_u128(9300)).unwrap(),
+                |_, _| Box::pin(async { panic!("Load failure must bypass writer") })).await.unwrap_err();
+            let constructor = store.constructor_writer_async_for_method_authorized::<EchoDurableState, proto::Text, proto::Text, _>(
+                "generic.Constructor", &policy,
+                context.writer_with_key(proto::Text::default(), Uuid::from_u128(9301)).unwrap(),
+                |_, _| Box::pin(async { panic!("Load failure must bypass constructor") })).await.unwrap_err();
+            for error in [reader, writer, constructor] {
+                assert_eq!(
+                    error.code(),
+                    if development {
+                        tonic::Code::Unavailable
+                    } else {
+                        tonic::Code::PermissionDenied
+                    }
+                );
+                assert_eq!(
+                    error.message(),
+                    if development {
+                        "actor authorization unavailable"
+                    } else {
+                        "no authorizer configured; unauthorized development must be explicitly enabled"
+                    }
+                );
+            }
+            let after = database.admission_rpc_counts();
+            assert_eq!(after.0 - before.0, if development { 3 } else { 0 });
+            assert_eq!(after.1, before.1);
+            assert!(database.store_requests().is_empty());
+            assert!(database.create_requests().is_empty());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn echo_adapter_preallow_load_diagnostics_are_not_disclosed() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationPolicy, AuthorizeFuture, Authorizer,
+        };
+        use proto::echo_methods_server::EchoMethods;
+        struct NoSnapshot;
+        impl Authorizer for NoSnapshot {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                _: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                panic!("failed Load must never fabricate a policy snapshot")
+            }
+        }
+        let (endpoint, database, database_server) = start_database().await;
+        let context = ExternalContext::new("load-diagnostic-secret");
+        for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
+            let mut fault = Status::with_details(
+                code,
+                "private-sidecar-path",
+                b"secret-details".as_slice().into(),
+            );
+            fault
+                .metadata_mut()
+                .insert("x-private-sidecar", "private-value".parse().unwrap());
+            database.fail_actor_load(fault);
+            for configured in [false, true] {
+                let policy = if configured {
+                    AuthorizationPolicy::new(None, Some(Arc::new(NoSnapshot)))
+                } else {
+                    AuthorizationPolicy::default()
+                };
+                let adapter = EchoMethodsAdapter::connect(&endpoint)
+                    .await
+                    .unwrap()
+                    .with_authorization(policy);
+                let before = database.admission_rpc_counts();
+                let errors = [
+                    adapter
+                        .last_message(context.reader(proto::Empty {}).unwrap())
+                        .await
+                        .unwrap_err(),
+                    adapter
+                        .reply(
+                            context
+                                .writer_with_key(
+                                    proto::Text {
+                                        content: "denied".into(),
+                                    },
+                                    Uuid::from_u128(9200),
+                                )
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap_err(),
+                ];
+                for error in errors {
+                    assert_eq!(
+                        error.code(),
+                        if configured && code == tonic::Code::Unavailable {
+                            tonic::Code::Unavailable
+                        } else {
+                            tonic::Code::PermissionDenied
+                        }
+                    );
+                    assert_eq!(
+                        error.message(),
+                        if configured {
+                            "actor authorization unavailable"
+                        } else {
+                            "no authorizer configured; unauthorized development must be explicitly enabled"
+                        }
+                    );
+                    assert!(error.details().is_empty());
+                    assert!(error.metadata().get("x-private-sidecar").is_none());
+                }
+                let after = database.admission_rpc_counts();
+                assert_eq!(after.0 - before.0, if configured { 2 } else { 0 });
+                assert_eq!(after.1, before.1);
+                assert!(database.store_requests().is_empty());
+            }
+        }
+        // Failed pre-admission calls neither persist effects nor poison a later grant.
+        database.clear_actor_load_failure();
+        let adapter = EchoMethodsAdapter::connect(&endpoint)
+            .await
+            .unwrap()
+            .with_authorization(AuthorizationPolicy::permissive_for_development());
+        let body = proto::Text {
+            content: "healthy-after-fault".into(),
+        };
+        let key = Uuid::from_u128(9201);
+        assert_eq!(
+            adapter
+                .reply(context.writer_with_key(body.clone(), key).unwrap())
+                .await
+                .unwrap()
+                .into_inner(),
+            body
+        );
+        let stored = database.store_requests().len();
+        assert_eq!(stored, 1);
+        assert_eq!(
+            adapter
+                .reply(context.writer_with_key(body.clone(), key).unwrap())
+                .await
+                .unwrap()
+                .into_inner(),
+            body
+        );
+        assert_eq!(
+            adapter
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap()
+                .into_inner(),
+            body
+        );
+        assert_eq!(database.store_requests().len(), stored);
+        database_server.abort();
+    }
+
+    #[tokio::test]
+    async fn echo_adapter_authorizes_current_state_before_read_and_revoked_replay() {
+        use crate::auth::{
+            Auth, AuthorizationContext, AuthorizationDecision, AuthorizationPolicy,
+            AuthorizeFuture, Authorizer,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Policy {
+            allowed: AtomicBool,
+            snapshots: Mutex<Vec<proto::Echo>>,
+        }
+        impl Authorizer for Policy {
+            fn authorize<'a>(
+                &'a self,
+                context: &'a AuthorizationContext,
+                _: Option<&'a Auth>,
+                state: Option<&'a [u8]>,
+                _: &'a [u8],
+            ) -> AuthorizeFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(context.state_type, "tests.reboot.protoc.Echo");
+                    assert_eq!(context.headers.state_ref, "authorized-echo");
+                    assert!(matches!(
+                        context.method.as_str(),
+                        "tests.reboot.protoc.EchoMethods.Reply"
+                            | "tests.reboot.protoc.EchoMethods.LastMessage"
+                    ));
+                    self.snapshots
+                        .lock()
+                        .unwrap()
+                        .push(proto::Echo::decode(state.unwrap()).unwrap());
+                    if self.allowed.load(Ordering::SeqCst) {
+                        AuthorizationDecision::Allow
+                    } else {
+                        AuthorizationDecision::PermissionDenied {
+                            message: "revoked".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let (database_address, database, database_server) = start_database().await;
+        let context = ExternalContext::new("authorized-echo");
+        let key = Uuid::from_u128(7001);
+        let a = proto::Text {
+            content: "A".into(),
+        };
+        let b = proto::Text {
+            content: "B".into(),
+        };
+        let adapter = EchoMethodsAdapter::connect(&database_address)
+            .await
+            .unwrap();
+        let (address, host_server) = start_echo_adapter(adapter.clone()).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .reply(context.writer_with_key(a.clone(), key).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(database.store_requests().is_empty());
+        host_server.abort();
+        let policy = Arc::new(Policy {
+            allowed: AtomicBool::new(true),
+            snapshots: Mutex::new(Vec::new()),
+        });
+        let authorization = AuthorizationPolicy::new(None, Some(policy.clone()));
+        let (address, host_server) =
+            start_echo_adapter(adapter.with_authorization(authorization.clone())).await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .reply(context.writer_with_key(a.clone(), key).unwrap())
+                .await
+                .unwrap()
+                .into_inner(),
+            a
+        );
+        assert_eq!(
+            client
+                .reply(
+                    context
+                        .writer_with_key(b.clone(), Uuid::from_u128(7002))
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .into_inner(),
+            b
+        );
+        policy.allowed.store(false, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .reply(context.writer_with_key(a.clone(), key).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                client
+                    .last_message(context.reader(proto::Empty {}).unwrap())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        assert_eq!(database.store_requests().len(), 2);
+        host_server.abort();
+        let (address, host_server) = start_echo_adapter(
+            EchoMethodsAdapter::connect(&database_address)
+                .await
+                .unwrap()
+                .with_authorization(authorization),
+        )
+        .await;
+        let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .reply(context.writer_with_key(a, key).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        {
+            let snapshots = policy.snapshots.lock().unwrap();
+            assert_eq!(snapshots.len(), 8);
+            assert_eq!(snapshots[0], proto::Echo::default());
+            assert_eq!(snapshots[1].last_message.as_ref().unwrap().content, "A");
+            assert!(
+                snapshots[2..]
+                    .iter()
+                    .all(|state| state.last_message.as_ref() == Some(&b))
+            );
+        }
+        policy.allowed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .last_message(context.reader(proto::Empty {}).unwrap())
+                .await
+                .unwrap()
+                .into_inner(),
+            b
+        );
+        assert_eq!(database.store_requests().len(), 2);
+        host_server.abort();
+        database_server.abort();
+    }
+
+    #[tokio::test]
     async fn echo_adapter_recreation_replays_persisted_reply_and_stores_atomically() {
         let (database_address, database, database_server) = start_database().await;
         let context = ExternalContext::new("database-durable-echo");
@@ -6371,7 +7846,8 @@ mod tests {
         let (address, host_server) = start_echo_adapter(
             EchoMethodsAdapter::connect(&database_address)
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         )
         .await;
         let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
@@ -6397,7 +7873,8 @@ mod tests {
         let (address, host_server) = start_echo_adapter(
             EchoMethodsAdapter::connect(&database_address)
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         )
         .await;
         let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
@@ -6462,7 +7939,8 @@ mod tests {
         let (address, host_server) = start_echo_adapter(
             EchoMethodsAdapter::connect(&database_address)
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
         )
         .await;
         let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
@@ -6926,8 +8404,12 @@ mod tests {
         let context = ExternalContext::new("durable-echo");
         let key = Uuid::from_u128(7);
 
-        let (address, server) =
-            start_file_host(FileBackedHost::open(directory.path()).unwrap()).await;
+        let (address, server) = start_file_host(
+            FileBackedHost::open(directory.path())
+                .unwrap()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
+        )
+        .await;
         let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
             .await
             .unwrap();
@@ -6948,8 +8430,12 @@ mod tests {
         assert_eq!(first.content, "persisted");
         server.abort();
 
-        let (address, server) =
-            start_file_host(FileBackedHost::open(directory.path()).unwrap()).await;
+        let (address, server) = start_file_host(
+            FileBackedHost::open(directory.path())
+                .unwrap()
+                .with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
+        )
+        .await;
         let mut client = proto::echo_methods_client::EchoMethodsClient::connect(address)
             .await
             .unwrap();

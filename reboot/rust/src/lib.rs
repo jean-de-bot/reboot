@@ -5,13 +5,13 @@
 //! them to satisfy `clippy::result_large_err` would make the bindings invalid.
 #![allow(clippy::result_large_err)]
 //!
-//! This is an experimental schema and transport spike. It proves that Rust can
-//! emit Reboot's existing descriptor format and validate the isolated Native2pc
-//! v1 transport contract without Python or Node.js. It does not claim to host a
-//! production Rust servicer: the current `rbt dev run` launcher supports only
-//! `--python` and `--nodejs`. The [`runtime`] module provides deliberately
-//! scoped Tonic service adapters for executable testing; [`native_2pc`] remains
-//! an explicitly non-executable control-plane boundary.
+//! This SDK is experimental and checkout-only. `rbt dev run --rust` supports
+//! bounded local generated applications; it is not a production Rust launcher.
+//! Keep the runtime, generator, CLI and canonical Database on the verified source
+//! snapshot, and regenerate adapters when upgrading. Newly generated adapters
+//! enforce the narrow Rust API contract in [`versioning`]; this is not native
+//! wire compatibility, persisted-state migration or release certification.
+//! See `reboot/rust/PARITY.md` for exercised capabilities and remaining limits.
 
 pub mod application_host;
 pub mod auth;
@@ -42,6 +42,7 @@ pub mod sorted_map_proto {
     tonic::include_proto!("rbt.std.collections.v1");
 }
 pub mod successful_trailers;
+pub mod versioning;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use prost::Message;

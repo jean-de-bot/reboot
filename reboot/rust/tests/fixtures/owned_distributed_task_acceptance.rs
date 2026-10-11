@@ -192,14 +192,7 @@ impl DistributedTasks {
     fn new() -> Self {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/generated_cxx_database_process");
-        assert!(
-            Command::new("cargo")
-                .args(["build", "--locked"])
-                .current_dir(&fixture)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::prepare_generated_host(&fixture);
         let binary = generated_host_binary(&fixture);
         let database = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
         let root_db = CxxDatabase::start(database.clone());

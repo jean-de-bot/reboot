@@ -16,14 +16,7 @@ impl SupervisedTree {
     fn with_refs(refs: [String; 3]) -> Self {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/generated_cxx_database_process");
-        assert!(
-            Command::new("cargo")
-                .args(["build", "--locked"])
-                .current_dir(&fixture)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::prepare_generated_host(&fixture);
         let binary = generated_host_binary(&fixture);
         let database = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
         let databases = std::array::from_fn(|_| CxxDatabase::start(database.clone()));

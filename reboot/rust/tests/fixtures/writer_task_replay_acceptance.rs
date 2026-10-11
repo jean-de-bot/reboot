@@ -10,14 +10,7 @@ include!("task_declared_custom_acceptance.rs");
 fn generated_writer_task_store_checkpoint_restart_original_response() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());
@@ -336,14 +329,7 @@ fn writer_command(options: WriterHostOptions<'_>) -> Command {
 fn generated_writer_task_pre_store_exclusive_and_uncertain_ack_restart() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     for vector in [
         "pre-store",

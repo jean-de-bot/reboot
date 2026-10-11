@@ -43,8 +43,51 @@ use reboot_rust_schema::{database_proto as database, placement_proto};
 use sha1::{Digest as _, Sha1};
 use uuid::Uuid;
 
+// Acceptance freezes source and build configuration for this process. Cache only
+// successful binary preparation, never runtime state or behavioral results.
+fn prepare_once<T>(
+    slot: &std::sync::OnceLock<Result<T, String>>,
+    prepare: impl FnOnce() -> Result<T, String>,
+) -> Result<&T, &str> {
+    slot.get_or_init(prepare).as_ref().map_err(String::as_str)
+}
+
+fn prepare_generated_host(fixture: &std::path::Path) {
+    static PREPARED: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
+        std::sync::OnceLock::new();
+    let binary = prepare_once(&PREPARED, || {
+        let status = Command::new("cargo")
+            .args(["build", "--locked"])
+            .current_dir(fixture)
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("generated host preparation failed: {status}"));
+        }
+        let binary = generated_host_binary(fixture);
+        if !binary.is_file() {
+            return Err(format!("generated host missing: {}", binary.display()));
+        }
+        Ok(binary)
+    })
+    .expect("frozen generated host preparation");
+    assert_eq!(
+        binary,
+        &generated_host_binary(fixture),
+        "build configuration changed during frozen acceptance"
+    );
+    assert!(binary.is_file(), "prepared generated host was removed");
+}
+
 fn generated_host_binary(fixture: &std::path::Path) -> std::path::PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
+    generated_host_binary_for_target(fixture, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+fn generated_host_binary_for_target(
+    fixture: &std::path::Path,
+    target: Option<&std::ffi::OsStr>,
+) -> std::path::PathBuf {
+    let target = target
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| fixture.join("target"));
     // A relative Cargo target is resolved from the fixture's build directory.
@@ -54,6 +97,63 @@ fn generated_host_binary(fixture: &std::path::Path) -> std::path::PathBuf {
         fixture.join(target)
     };
     target.join("debug/generated-cxx-database-process-host")
+}
+
+#[test]
+fn frozen_preparation_concurrent_callers_build_once() {
+    let slot = std::sync::OnceLock::new();
+    let calls = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                assert_eq!(
+                    prepare_once(&slot, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    }),
+                    Ok(&42)
+                );
+            });
+        }
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn frozen_preparation_failure_never_returns_a_usable_artifact() {
+    let slot = std::sync::OnceLock::<Result<usize, String>>::new();
+    assert_eq!(
+        prepare_once(&slot, || Err("build failed".into())),
+        Err("build failed")
+    );
+    assert_eq!(prepare_once(&slot, || Ok(42)), Err("build failed"));
+    // A separate process has a fresh slot and must prepare again.
+    let fresh = std::sync::OnceLock::new();
+    assert_eq!(prepare_once(&fresh, || Ok(42)), Ok(&42));
+}
+
+#[test]
+fn frozen_preparation_target_resolution() {
+    let fixture = std::path::Path::new("/fixture");
+    for (target, expected) in [
+        (
+            None,
+            "/fixture/target/debug/generated-cxx-database-process-host",
+        ),
+        (
+            Some("relative"),
+            "/fixture/relative/debug/generated-cxx-database-process-host",
+        ),
+        (
+            Some("/absolute"),
+            "/absolute/debug/generated-cxx-database-process-host",
+        ),
+    ] {
+        assert_eq!(
+            generated_host_binary_for_target(fixture, target.map(std::ffi::OsStr::new)),
+            std::path::PathBuf::from(expected)
+        );
+    }
 }
 
 type PlacementPlanResult = Result<placement_proto::ListenForPlanResponse, tonic::Status>;
@@ -881,14 +981,7 @@ fn generated_external_constructor_declared_error_leaves_real_cxx_database_empty_
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -975,14 +1068,7 @@ fn generated_external_unavailable_retry_replays_once_through_restarted_real_cxx_
     let database_binary = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1031,14 +1117,7 @@ fn generated_root_declared_outbound_errors_commit_or_abort_durably_through_real_
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1176,14 +1255,7 @@ fn generated_transaction_replay_authorizes_current_native_state_before_cached_fa
  {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1321,14 +1393,7 @@ fn generated_root_exclusive_idempotency_is_durable_replayed_and_collision_safe()
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1396,14 +1461,7 @@ fn generated_application_host_recovers_idempotent_root_exactly_once_after_decisi
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1491,14 +1549,7 @@ fn generated_factory_root_idempotency_replays_before_absent_state_admission_and_
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1565,14 +1616,7 @@ fn generated_factory_root_idempotency_recovers_after_post_decision_crash() {
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1657,14 +1701,7 @@ fn generated_shared_roots_overlap_without_mutation_then_exclusive_works() {
     let database_binary = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1724,14 +1761,7 @@ fn generated_fresh_shared_noop_releases_without_a_durable_recovery_decision() {
     let database_binary = std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1792,14 +1822,7 @@ fn generated_fresh_shared_local_promotion_recovers_after_durable_decision() {
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1864,14 +1887,7 @@ fn generated_exclusive_cross_actor_recovers_through_real_cxx_database_processes(
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut root_db = CxxDatabase::start(database_binary.clone());
     let mut target_db = CxxDatabase::start(database_binary);
@@ -2003,14 +2019,7 @@ fn generated_exclusive_factory_creates_only_absent_actor_through_real_cxx_databa
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     // Do not seed this state type or actor. C++ Load deliberately omits an
@@ -2048,14 +2057,7 @@ fn generated_exclusive_factory_creates_root_and_commits_existing_target_through_
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2146,14 +2148,7 @@ fn generated_factory_root_recovers_target_across_two_cxx_database_processes() {
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     // The root factory actor and pre-existing target actor live in separate
     // C++ Database/RocksDB sidecars; no shared sidecar can mask routing.
@@ -2331,14 +2326,7 @@ fn generated_fresh_exclusive_default_state_persists_through_live_placement_plann
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2396,14 +2384,7 @@ fn generated_factory_declared_error_aborts_then_retries_once_through_live_placem
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut db = CxxDatabase::start(database_binary);
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2533,14 +2514,7 @@ fn generated_factory_root_recovers_target_through_live_placement_planner_across_
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut root_db = CxxDatabase::start(database_binary.clone());
     let mut target_db = CxxDatabase::start(database_binary);
@@ -2807,14 +2781,7 @@ fn generated_legacy_root_recovers_two_remote_participants_through_live_placement
         std::env::var("REBOOT_NATIVE2PC_CXX_DATABASE").expect("Bazel //reboot/server:database");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/generated_cxx_database_process");
-    assert!(
-        Command::new("cargo")
-            .args(["build", "--locked"])
-            .current_dir(&fixture)
-            .status()
-            .unwrap()
-            .success()
-    );
+    crate::prepare_generated_host(&fixture);
     let binary = generated_host_binary(&fixture);
     let mut root_db = CxxDatabase::start(database_binary.clone());
     let mut target_a_db = CxxDatabase::start(database_binary.clone());

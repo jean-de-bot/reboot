@@ -419,7 +419,7 @@ mod tests {
         let host = || {
             ApplicationHost::new("registry-test").add_public_service(
                 crate::proto::echo_methods_server::EchoMethodsServer::new(
-                    crate::runtime::InMemoryHost::default(),
+                    crate::runtime::InMemoryHost::default().with_authorization(crate::auth::AuthorizationPolicy::permissive_for_development()),
                 ),
             )
         };
